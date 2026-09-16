@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="es-CL">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Planificador de clases</title>
+    <script>
+      // El navegador no puede llamar a la API de Anthropic directamente.
+      // Las peticiones pasan por el proxy definido en vite.config.js.
+      window.__API_URL__ = "/v1/messages";
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

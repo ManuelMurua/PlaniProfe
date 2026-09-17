@@ -398,38 +398,52 @@ export function planRespaldo(cursos, bloques, ctx, multigrado) {
       : "La clase parte de una situación cercana a los estudiantes, se profundiza con una actividad guiada y cierra retomando el objetivo.",
     inicio: {
       min: t.inicio,
-      comun: [
+      estudiantes: [
         "Saludo y ronda breve: cada estudiante dice una palabra sobre cómo llega hoy.",
+        "Responden la pregunta de activación desde lo que ya saben.",
+      ],
+      docente: [
         multigrado
-          ? "El o la docente presenta la situación común y la escribe en la pizarra, una fila por curso con lo que va a aprender cada uno."
-          : "El o la docente presenta el objetivo de la clase y lo escribe en la pizarra con sus palabras.",
-        "Activación de conocimientos previos con una pregunta que todos puedan responder desde su nivel.",
+          ? "Presenta la situación común y la escribe en la pizarra, una fila por curso con lo que va a aprender cada uno."
+          : "Presenta el objetivo de la clase y lo escribe en la pizarra con sus palabras.",
+        "Hace la pregunta de activación asegurando que todos puedan responder desde su nivel.",
       ],
       pregunta: "¿Qué sabemos ya sobre esto y qué queremos averiguar hoy?",
     },
     desarrollo: {
       min: t.desarrollo,
-      comun: multigrado
+      comunEstudiantes: multigrado ? ["Observan el modelaje del docente hecho con el curso más avanzado."] : [],
+      comunDocente: multigrado
         ? [
-            "Modelaje breve frente a todos: el docente muestra el procedimiento con el curso más avanzado y los demás observan, luego lo repite simplificado.",
-            "Turnos de atención directa por curso mientras el resto trabaja de forma autónoma con la pauta.",
+            "Modela el procedimiento frente a todos con el curso más avanzado y luego lo repite simplificado.",
+            "Organiza turnos de atención directa por curso mientras el resto trabaja de forma autónoma con la pauta.",
           ]
         : [],
       porCurso: cursos.map((c, i) => ({
-        pasos: [
-          `Trabajo guiado con material concreto sobre ${c.oas.map((o) => o.texto).join("; ")}.`,
-          "Registro en el cuaderno con apoyo de un modelo pegado en la mesa.",
+        estudiantes: [
+          `Trabajan con material concreto sobre ${c.oas.map((o) => o.texto).join("; ")}.`,
+          "Registran en el cuaderno con apoyo de un modelo pegado en la mesa.",
           i === 0
-            ? "Verificación con el docente antes de pasar a la práctica independiente."
-            : "Trabajo autónomo con pauta escrita paso a paso, comparando en pareja con un compañero.",
+            ? "Verifican con el docente antes de pasar a la práctica independiente."
+            : "Trabajan de forma autónoma con pauta escrita paso a paso, comparando en pareja con un compañero.",
+        ],
+        docente: [
+          "Entrega el material concreto y explica la tarea con un ejemplo resuelto.",
+          i === 0
+            ? "Revisa el registro de cada estudiante antes de dar la práctica independiente."
+            : "Circula por la sala para resolver dudas puntuales sin resolver la tarea por el estudiante.",
         ],
       })),
     },
     cierre: {
       min: t.cierre,
-      comun: [
-        multigrado ? "Puesta en común: un estudiante de cada curso muestra su trabajo." : "Puesta en común: dos o tres estudiantes muestran su trabajo.",
-        "El docente vuelve al objetivo escrito en la pizarra y marca lo logrado.",
+      estudiantes: [
+        multigrado ? "Un estudiante de cada curso muestra su trabajo." : "Dos o tres estudiantes muestran su trabajo.",
+        "Responden las preguntas de metacognición.",
+      ],
+      docente: [
+        "Vuelve al objetivo escrito en la pizarra y marca lo logrado con el curso.",
+        "Hace las preguntas de metacognición y recoge dos o tres respuestas.",
       ],
       metacognicion: [
         "¿Qué me resultó fácil y qué me costó?",
@@ -500,19 +514,31 @@ export function planTexto(p) {
     });
   });
   L.push(`\n## Inicio (${p.inicio.min} min)`);
-  (p.inicio.comun || []).forEach((x) => L.push(`- ${x}`));
+  L.push(`Estudiantes:`);
+  (p.inicio.estudiantes || []).forEach((x) => L.push(`- ${x}`));
+  L.push(`Docente:`);
+  (p.inicio.docente || []).forEach((x) => L.push(`- ${x}`));
   if (p.inicio.pregunta) L.push(`Pregunta motivadora: ${p.inicio.pregunta}`);
   L.push(`\n## Desarrollo (${p.desarrollo.min} min)`);
-  if ((p.desarrollo.comun || []).length) {
+  if ((p.desarrollo.comunEstudiantes || []).length || (p.desarrollo.comunDocente || []).length) {
     L.push(`Con todos los cursos:`);
-    p.desarrollo.comun.forEach((x) => L.push(`- ${x}`));
+    L.push(`Estudiantes:`);
+    (p.desarrollo.comunEstudiantes || []).forEach((x) => L.push(`- ${x}`));
+    L.push(`Docente:`);
+    (p.desarrollo.comunDocente || []).forEach((x) => L.push(`- ${x}`));
   }
   (p.desarrollo.porCurso || []).forEach((pc, i) => {
     L.push(`${p.meta.cursos[i]?.gradoNombre || "Curso " + (i + 1)}:`);
-    (pc.pasos || []).forEach((x) => L.push(`- ${x}`));
+    L.push(`Estudiantes:`);
+    (pc.estudiantes || []).forEach((x) => L.push(`- ${x}`));
+    L.push(`Docente:`);
+    (pc.docente || []).forEach((x) => L.push(`- ${x}`));
   });
   L.push(`\n## Cierre (${p.cierre.min} min)`);
-  (p.cierre.comun || []).forEach((x) => L.push(`- ${x}`));
+  L.push(`Estudiantes:`);
+  (p.cierre.estudiantes || []).forEach((x) => L.push(`- ${x}`));
+  L.push(`Docente:`);
+  (p.cierre.docente || []).forEach((x) => L.push(`- ${x}`));
   (p.cierre.metacognicion || []).forEach((x) => L.push(`- Pregunta: ${x}`));
   L.push(`\n## Diversificación (DUA)`);
   L.push(`Representación:`);

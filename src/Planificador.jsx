@@ -272,20 +272,22 @@ ${cursos.map((c) => `${c.gradoNombre.toUpperCase()} — ${c.asig.nombre}\n${list
 
     const promptA = `${encabezado}
 
-Diseña la clase con inicio, desarrollo y cierre. ${
+Diseña la clase con inicio, desarrollo y cierre. En cada momento separa dos cosas: la secuencia de lo que hacen los ESTUDIANTES (acciones concretas y observables) y las ORIENTACIONES AL DOCENTE (qué debe hacer y cómo hacerlo: instrucciones a dar, materiales a repartir, qué modelar, qué preguntar, cómo manejar al grupo). ${
       multigrado
         ? "Los momentos comunes son para todos los cursos juntos; 'porCurso' trae el trabajo diferenciado simultáneo, un elemento por curso, en el mismo orden en que aparecen arriba."
-        : "Es una clase para un solo curso: usa 'comun' para lo que se hace con todo el curso y deja 'porCurso' con un único elemento con los pasos principales de la clase."
-    } Integra los distintos objetivos seleccionados de cada curso, no solo uno. Sé concreto: nombra la actividad, el material y lo que hace el docente. Cada punto en máximo 25 palabras.
+        : "Es una clase para un solo curso: usa los campos comunes para lo que se hace con todo el curso y deja 'porCurso' con un único elemento con la secuencia principal de la clase."
+    } Integra los distintos objetivos seleccionados de cada curso, no solo uno. Sé concreto: nombra la actividad y el material. Cada punto en máximo 25 palabras.
 
 Además, redacta el objetivo de la clase de cada curso: una frase breve dirigida a los estudiantes (por ejemplo "Hoy aprenderemos a..."), que priorice los indicadores elegidos por el docente cuando existan, o resuma los OA del curso si no hay ninguno elegido. Un objetivo por curso, en el mismo orden en que aparecen arriba.
 
 Responde SOLO JSON, sin markdown:
 {"titulo":"título de la clase, máx 10 palabras","hilo":"situación o tema que articula la clase, máx 30 palabras","objetivosClase":[${cursos
       .map(() => '"objetivo de la clase de este curso, en lenguaje para estudiantes, máx 25 palabras"')
-      .join(",")}],"inicio":{"min":${t.inicio},"comun":["3 a 4 acciones"],"pregunta":"pregunta motivadora"},"desarrollo":{"min":${t.desarrollo},"comun":["1 o 2 momentos con todos los cursos${multigrado ? ", incluida la rotación de atención del docente" : ""}"],"porCurso":[${cursos
-      .map(() => '{"pasos":["3 a 4 pasos"]}')
-      .join(",")}]},"cierre":{"min":${t.cierre},"comun":["2 o 3 acciones"],"metacognicion":["3 preguntas para los estudiantes"]}}`;
+      .join(",")}],"inicio":{"min":${t.inicio},"estudiantes":["3 a 4 acciones que hacen los estudiantes"],"docente":["3 a 4 orientaciones de qué hacer y cómo"],"pregunta":"pregunta motivadora"},"desarrollo":{"min":${t.desarrollo},"comunEstudiantes":[${multigrado ? '"acciones de todos los cursos juntos"' : '"vacío, no aplica a un solo curso"'}],"comunDocente":[${
+      multigrado ? '"orientaciones para el momento común, incluida la rotación de atención del docente"' : '"vacío, no aplica a un solo curso"'
+    }],"porCurso":[${cursos
+      .map(() => '{"estudiantes":["3 a 4 acciones concretas del estudiante"],"docente":["3 a 4 orientaciones de qué hacer y cómo, incluido el manejo de este grupo"]}')
+      .join(",")}]},"cierre":{"min":${t.cierre},"estudiantes":["2 a 3 acciones de los estudiantes"],"docente":["2 a 3 orientaciones de qué hacer y cómo"],"metacognicion":["3 preguntas para los estudiantes"]}}`;
 
     const promptB = `${encabezado}
 
@@ -895,7 +897,12 @@ Responde SOLO JSON, sin markdown:
                 <span className="min">{plan.inicio.min} minutos</span>
               </div>
               <div className="comun">
-                <Bullets items={plan.inicio.comun} />
+                <div className="lbl">Estudiantes</div>
+                <Bullets items={plan.inicio.estudiantes} />
+                <div className="lbl" style={{ marginTop: 10 }}>
+                  Orientación al docente
+                </div>
+                <Bullets items={plan.inicio.docente} />
                 {plan.inicio.pregunta && (
                   <p style={{ margin: "8px 0 0", fontSize: 14 }}>
                     <strong>Pregunta que abre la clase:</strong> {plan.inicio.pregunta}
@@ -909,17 +916,26 @@ Responde SOLO JSON, sin markdown:
                 <h3>Desarrollo</h3>
                 <span className="min">{plan.desarrollo.min} minutos</span>
               </div>
-              {(plan.desarrollo.comun || []).length > 0 && (
+              {((plan.desarrollo.comunEstudiantes || []).length > 0 || (plan.desarrollo.comunDocente || []).length > 0) && (
                 <div className="comun">
-                  <div className="lbl">Con todos los cursos</div>
-                  <Bullets items={plan.desarrollo.comun} />
+                  <div className="lbl">Estudiantes, con todos los cursos</div>
+                  <Bullets items={plan.desarrollo.comunEstudiantes} />
+                  <div className="lbl" style={{ marginTop: 10 }}>
+                    Orientación al docente
+                  </div>
+                  <Bullets items={plan.desarrollo.comunDocente} />
                 </div>
               )}
               <div className="split" style={{ "--n": plan.meta.cursos.length }}>
                 {plan.meta.cursos.map((c, i) => (
                   <div key={i} className={"col" + (i < plan.meta.cursos.length - 1 ? " borde" : "")}>
                     {plan.meta.cursos.length > 1 && <h4 style={{ color: colorDe(i) }}>{c.gradoNombre} trabaja en</h4>}
-                    <Bullets items={plan.desarrollo.porCurso?.[i]?.pasos} />
+                    <div className="lbl">Estudiantes</div>
+                    <Bullets items={plan.desarrollo.porCurso?.[i]?.estudiantes} />
+                    <div className="lbl" style={{ marginTop: 10 }}>
+                      Orientación al docente
+                    </div>
+                    <Bullets items={plan.desarrollo.porCurso?.[i]?.docente} />
                   </div>
                 ))}
               </div>
@@ -931,7 +947,12 @@ Responde SOLO JSON, sin markdown:
                 <span className="min">{plan.cierre.min} minutos</span>
               </div>
               <div className="comun">
-                <Bullets items={plan.cierre.comun} />
+                <div className="lbl">Estudiantes</div>
+                <Bullets items={plan.cierre.estudiantes} />
+                <div className="lbl" style={{ marginTop: 10 }}>
+                  Orientación al docente
+                </div>
+                <Bullets items={plan.cierre.docente} />
                 <div className="lbl" style={{ marginTop: 10 }}>
                   Preguntas para los estudiantes
                 </div>

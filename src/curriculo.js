@@ -3,6 +3,8 @@
    y probar directamente con Node. Ver curriculo.selfcheck.mjs.
    ============================================================ */
 
+import { PORTALES, PAGINA_ASIGNATURA } from "./recursos.js";
+
 export const GRADOS = [
   { id: "B1", nombre: "1º básico" },
   { id: "B2", nombre: "2º básico" },
@@ -379,11 +381,361 @@ export function objetivoClaseDe(curso) {
   return base.join(" ");
 }
 
-// Ficha de trabajo mínima, generada sin conexión a partir de los objetivos seleccionados.
-export function fichaBasica(cursos) {
-  const items = cursos.flatMap((c) => c.oas.map((o) => o.texto));
-  const cuerpo = items.length ? items.map((t, i) => `${i + 1}. ${t}`).join("\n") : "1. Completa según el objetivo de la clase.";
-  return `Nombre: _______________________________  Curso: _______________________\n\nResponde o dibuja según corresponda:\n\n${cuerpo}`;
+/* ============================================================
+   MATERIALES: esquema, links y versión sin conexión
+   Cada material: { id, tipo, titulo, proposito, momento, curso,
+   cantidad {unidad, numero, total}, preparacion[], instrucciones_uso[],
+   contenido, solucionario, adecuacion, alternativa_sin_tecnologia,
+   referencias [{fuente, titulo, url, tipo_link}], link (el del docente) }
+   ============================================================ */
+
+export const TIPOS_MINIMOS = ["guia_estudiante", "texto_modelo", "instrumento_evaluacion", "ticket_salida", "materiales_fisicos", "recurso_mineduc"];
+const EXTERNOS = ["recurso_mineduc", "video", "sitio", "software", "cuento"];
+const GRADUADOS = ["guia_estudiante", "ticket_salida", "instrumento_evaluacion"];
+const UNIDADES = ["por estudiante", "por grupo", "por pareja", "docente"];
+const MOMENTOS = ["inicio", "desarrollo", "cierre"];
+const MOMENTO_DEFECTO = { texto_modelo: "inicio", ticket_salida: "cierre", materiales_fisicos: "inicio" };
+const PORTAL_TIPO = { guia_estudiante: "textos", texto_modelo: "textos", instrumento_evaluacion: "eval_formativa", ticket_salida: "eval_formativa", materiales_fisicos: "dua", recurso_mineduc: "textos", cuento: "bde" };
+
+export const ETIQUETA_LINK = { ia: "Sugerido por IA · verificar", curado: "Verificado Mineduc", busqueda: "Búsqueda sugerida" };
+
+const vacio = (x) => !String(x ?? "").trim();
+const textos = (x) => (Array.isArray(x) ? x : [x]).map((s) => String(s ?? "").trim()).filter(Boolean);
+
+export function esHttps(url) {
+  try {
+    const u = new URL(String(url));
+    return u.protocol === "https:" && !!u.hostname;
+  } catch (e) {
+    return false;
+  }
+}
+
+function portal(id) {
+  const p = PORTALES.find((x) => x.id === id);
+  return p ? { fuente: "Mineduc", titulo: p.nombre, url: p.url, tipo_link: "curado" } : null;
+}
+
+// Links de búsqueda deterministas: siempre incluyen asignatura y curso.
+export function busquedas(curso) {
+  const asig = curso?.asig?.nombre || "";
+  const g = curso?.gradoNombre || "";
+  const o = curso?.oas?.[0];
+  const tema = String(o?.indElegidos?.[0]?.c || o?.indicadores?.[0]?.c || o?.texto || "").split(/\s+/).slice(0, 6).join(" ");
+  return [
+    { fuente: "YouTube", titulo: `Videos: ${asig} ${g} ${tema}`.trim(), url: `https://www.youtube.com/results?search_query=${encodeURIComponent(`${asig} ${g} ${tema}`.trim())}`, tipo_link: "busqueda" },
+    { fuente: "Curriculum Nacional", titulo: `Buscar ${o?.cod || "el OA"} de ${asig} ${g}`, url: `https://www.google.com/search?q=${encodeURIComponent(`site:curriculumnacional.cl ${asig} ${g} ${o?.cod || ""}`.trim())}`, tipo_link: "busqueda" },
+  ];
+}
+
+// Links de la API: se aceptan solo https (tipo "ia"); un {id} de portal se resuelve con la lista curada.
+// Lo que no sirve se descarta y se reemplaza por búsqueda. Siempre se suman 2 portales Mineduc verificados.
+export function normalizarReferencias(refs, tipo, curso) {
+  const out = [];
+  let descartado = false;
+  (Array.isArray(refs) ? refs : []).forEach((r) => {
+    if (!r) return;
+    const p = r.id && portal(r.id);
+    if (p) out.push(p);
+    else if (esHttps(r.url)) out.push({ fuente: r.fuente || "Sugerido por IA", titulo: r.titulo || r.url, url: r.url, tipo_link: "ia" });
+    else descartado = true;
+  });
+  if (descartado || (EXTERNOS.includes(tipo) && !out.some((r) => r.tipo_link === "ia"))) out.push(...busquedas(curso));
+  const pag = curso?.asig?.id && PAGINA_ASIGNATURA[curso.asig.id]?.porCurso(curso.grado);
+  out.push(pag ? { fuente: "Curriculum Nacional", titulo: `${curso.asig.nombre} ${curso.gradoNombre}`, url: pag, tipo_link: "curado" } : portal("curriculum"));
+  out.push(portal(PORTAL_TIPO[tipo] || "aprendo"));
+  return out.filter((r, i) => out.findIndex((x) => x.url === r.url) === i);
+}
+
+// N° de estudiantes de un curso según lo que escribió el docente ("25" o "1º básico: 5, 3º básico: 4"); null si no se sabe.
+export function numEstudiantes(texto, curso) {
+  const t = String(texto || "");
+  const pares = [...t.matchAll(/([^,;]*?)\s*:\s*(\d+)/g)];
+  if (pares.length) {
+    const clave = (s) => (s.match(/\d+/) || [""])[0] + (/medio/i.test(s) ? "M" : "B");
+    const p = curso && pares.find((m) => clave(m[1]) === clave(curso.gradoNombre || ""));
+    return p ? +p[2] : null;
+  }
+  const n = t.match(/\d+/);
+  return n ? +n[0] : null;
+}
+
+function estudiantesDe(ctx, cursos, curso) {
+  const lista = curso === "todos" ? cursos : [cursos[curso]];
+  const ns = lista.map((c) => numEstudiantes(ctx?.estudiantes, c));
+  return ns.length && ns.every((n) => n) ? ns.reduce((a, b) => a + b, 0) : null;
+}
+
+export function calcularTotal(unidad, numero, n) {
+  if (unidad === "docente") return `${numero} (para el docente)`;
+  if (!n) return `${numero} ${unidad} (N° de estudiantes)`;
+  if (unidad === "por grupo") return `${numero * Math.ceil(n / 4)} (${numero} por grupo, ${Math.ceil(n / 4)} grupos de 4)`;
+  if (unidad === "por pareja") return `${numero * Math.ceil(n / 2)} (${numero} por pareja, ${Math.ceil(n / 2)} parejas)`;
+  return `${numero * n} (${numero} por estudiante, ${n} estudiantes)`;
+}
+
+// Indicadores con los que se arman ítems y criterios: los elegidos por el docente o, si no hay, los de referencia del OA.
+function indicadoresDe(curso) {
+  const inds = (curso.oas || []).flatMap((o) =>
+    o.indElegidos?.length ? o.indElegidos : o.indicadores?.length ? o.indicadores.slice(0, 2) : indicadoresFallback(o, curso.asig?.id).slice(0, 2)
+  );
+  return (inds.length ? inds : [{ i: "Aplica lo aprendido en la clase.", h: "Aplica", c: "lo aprendido en la clase" }]).slice(0, 4);
+}
+
+export const criteriosDe = (curso) => indicadoresDe(curso).map((x) => x.i);
+
+const contenidoDe = (x) => String(x.c || x.i || "").replace(/\.$/, "").toLowerCase();
+const accionDe = (x) => `${x.h || "Aplica"} ${contenidoDe(x)}`;
+const encabezadoFicha = (curso) =>
+  `${curso.asig?.nombre || ""} · ${curso.gradoNombre || ""}\nNombre: _______________________________  Curso: ____________  Fecha: ____________\nObjetivo de hoy: ${objetivoClaseDe(curso) || "el objetivo de la clase"}`;
+
+// Plantillas por nivel y verbo (identificar, describir, resolver, comparar, crear). Cada ítem queda ligado a un indicador.
+const PLANTILLAS = [
+  { nivel: "BÁSICO", item: (x) => `Dibuja o escribe un ejemplo de: ${contenidoDe(x)}.`, sol: (x) => `Se espera un ejemplo correcto de ${contenidoDe(x)}. Si lo logra solo con material concreto, se registra como parcial.` },
+  { nivel: "BÁSICO", item: (x) => `Identifica: en el ejemplo resuelto del texto modelo, encierra dónde aparece ${contenidoDe(x)}.`, sol: (x) => `Se espera que marque los pasos 2 y 3 del texto modelo, donde se trabaja ${contenidoDe(x)}.` },
+  { nivel: "INTERMEDIO", item: (x) => `Explica con tus palabras: ¿qué es ${contenidoDe(x)} y cómo lo reconoces?`, sol: (x) => `Se espera que mencione al menos una característica de ${contenidoDe(x)} y dé un ejemplo propio.` },
+  { nivel: "INTERMEDIO", item: (x) => `Resuelve paso a paso la tarea gemela del texto modelo (${accionDe(x)}) y escribe cada paso.`, sol: (x) => `Se espera que siga los mismos pasos del ejemplo resuelto y llegue a un resultado correcto, cumpliendo: ${x.i}` },
+  { nivel: "DESAFÍO", item: (x) => `Compara: escribe o dibuja dos ejemplos distintos de ${contenidoDe(x)}. ¿En qué se parecen y en qué se diferencian?`, sol: (x) => `Se espera una semejanza y una diferencia correctas entre dos ejemplos válidos de ${contenidoDe(x)}.` },
+  { nivel: "DESAFÍO", item: (x) => `Crea tu propio ejemplo, pregunta o problema sobre ${contenidoDe(x)} y respóndelo.`, sol: (x) => `Se espera un ejemplo nuevo (no copiado del texto modelo), coherente con ${contenidoDe(x)} y bien resuelto.` },
+];
+
+// Guía del estudiante sin conexión: 6 ítems en 3 niveles a partir de los indicadores (nunca repite el texto del OA).
+export function fichaBasica(curso) {
+  const inds = indicadoresDe(curso);
+  const L = [encabezadoFicha(curso), "", "Instrucciones: lee cada pregunta con calma. Puedes responder escribiendo, dibujando o con el material concreto."];
+  const S = [];
+  PLANTILLAS.forEach((p, k) => {
+    const x = inds[k % inds.length];
+    if (k === 0 || PLANTILLAS[k - 1].nivel !== p.nivel) L.push("", `NIVEL ${p.nivel}`);
+    L.push(`${k + 1}. ${p.item(x)}`);
+    S.push(`${k + 1}. ${p.sol(x)} (Indicador: ${x.i})`);
+  });
+  return {
+    contenido: L.join("\n"),
+    solucionario: S.join("\n"),
+    adecuacion: `Versión con apoyo: responde solo los ítems 1, 2 y 3, con el texto modelo pegado en la mesa. En el ítem 3 puede responder oralmente al docente o con un dibujo. Las instrucciones se leen en voz alta, una a la vez.`,
+  };
+}
+
+// Set completo de materiales sin API: los 6 tipos mínimos, con guía, texto, instrumento, ticket y recurso Mineduc por curso.
+export function materialesRespaldo(cursos, ctx) {
+  const out = [];
+  const multi = cursos.length > 1;
+  const n = (curso) => estudiantesDe(ctx, cursos, curso);
+  const mat = (tipo, curso, campos, unidad = "por estudiante", numero = 1) => ({
+    tipo,
+    momento: MOMENTO_DEFECTO[tipo] || "desarrollo",
+    curso,
+    cantidad: { unidad, numero, total: calcularTotal(unidad, numero, n(curso)) },
+    ...campos,
+    referencias: normalizarReferencias([], tipo, cursos[curso === "todos" ? 0 : curso]),
+    link: "",
+  });
+  cursos.forEach((c, i) => {
+    const inds = indicadoresDe(c);
+    const g = c.gradoNombre || "";
+    const ficha = fichaBasica(c);
+    out.push(
+      mat("guia_estudiante", i, {
+        titulo: `Guía del estudiante: ${g}`,
+        proposito: "Practicar el objetivo de la clase en tres niveles de dificultad.",
+        preparacion: [`Imprime una guía por estudiante de ${g} (ver cantidad).`, "Lee el solucionario y resuelve tú el ítem 4 antes de la clase.", "Tiempo estimado: 10 min"],
+        instrucciones_uso: ["Entrega la guía después de modelar el texto modelo.", "Lee en voz alta las instrucciones y el ítem 1.", "Todos parten por el nivel básico; quien termina sigue al intermedio y al desafío.", "Revisa con el solucionario mientras circulas."],
+        contenido: ficha.contenido,
+        solucionario: ficha.solucionario,
+        adecuacion: ficha.adecuacion,
+        alternativa_sin_tecnologia: "Copia los ítems en la pizarra; los estudiantes responden en el cuaderno numerando cada ítem.",
+      }),
+      mat("texto_modelo", i, {
+        titulo: `Texto modelo (ejemplo resuelto): ${g}`,
+        proposito: "Mostrar paso a paso cómo se hace la tarea antes del trabajo autónomo.",
+        preparacion: ["Lee el guion y prepara el ejemplo con el material concreto.", "Escribe los 5 pasos en la pizarra o en un papelógrafo.", "Tiempo estimado: 10 min"],
+        instrucciones_uso: ["Desarrolla el ejemplo frente al curso pensando en voz alta.", "Deja los pasos escritos a la vista durante toda la clase.", "Pide a un estudiante que repita los pasos con sus palabras."],
+        contenido: [
+          `TEXTO MODELO — ${c.asig?.nombre || ""} · ${g}`,
+          "Para el docente: desarrolla este ejemplo frente al curso pensando en voz alta (unos 5 minutos).",
+          "",
+          `Tarea: ${accionDe(inds[0])}.`,
+          "Paso 1. Leo la tarea en voz alta y digo con mis palabras qué me piden.",
+          `Paso 2. Muestro qué sé: escribo o armo un ejemplo de ${contenidoDe(inds[0])} con el material concreto.`,
+          "Paso 3. Hago la tarea paso a paso y nombro cada paso mientras lo hago.",
+          `Paso 4. Reviso con la pregunta: ¿cumplo con "${inds[0].i}"?`,
+          "Paso 5. Digo en una frase lo que aprendí.",
+          "",
+          `Tarea gemela (ítem 4 de la guía): ${accionDe(inds[inds.length > 1 ? 1 : 0])}, con un ejemplo distinto al modelado.`,
+        ].join("\n"),
+        solucionario: "No aplica: es el ejemplo que el docente desarrolla frente al curso.",
+        adecuacion: "Entrega una copia de los 5 pasos, con un dibujo al lado de cada paso, para tener en la mesa durante la guía.",
+        alternativa_sin_tecnologia: "Escribe los 5 pasos en la pizarra y modela con el material concreto o con dibujos.",
+      }, "docente"),
+      mat(
+        "instrumento_evaluacion",
+        i,
+        {
+          titulo: `Lista de cotejo: ${g}`,
+          proposito: "Registrar el logro de cada estudiante en los indicadores de la clase.",
+          momento: "desarrollo",
+          preparacion: ["Imprime la lista y escribe los nombres del curso en la primera columna.", "Lee los criterios y ubica en el solucionario qué ítems los evidencian.", "Tiempo estimado: 5 min"],
+          instrucciones_uso: ["Marca mientras circulas durante la guía.", "Completa las marcas pendientes con el ticket de salida.", "Usa los resultados para planificar la próxima clase."],
+          contenido: [
+            `LISTA DE COTEJO — ${c.asig?.nombre || ""} · ${g}`,
+            "Estudiante: __________________________  Fecha: ____________",
+            "",
+            "Criterio | Logrado | Parcial | No logrado",
+            ...inds.map((x, k) => `${k + 1}. ${x.i} | ☐ | ☐ | ☐`),
+            "",
+            "Niveles:",
+            "Logrado: cumple el criterio de forma autónoma y correcta.",
+            "Parcial: cumple con apoyo del docente o del material, o con errores menores.",
+            "No logrado: aún no lo muestra, incluso con apoyo.",
+          ].join("\n"),
+          solucionario: inds
+            .map((x, k) => {
+              const items = PLANTILLAS.map((_, j) => j).filter((j) => j % inds.length === k).map((j) => j + 1);
+              return `${k + 1}. Evidencia: ítems ${items.join(", ")} de la guía${k < 2 ? ` y pregunta ${k + 1} del ticket de salida` : ""}. Se observa que ${x.i.charAt(0).toLowerCase() + x.i.slice(1)}`;
+            })
+            .join("\n"),
+          adecuacion: "Para estudiantes con NEE, registra el logro con apoyo como Parcial y anota qué apoyo usó (material, lectura, respuesta oral).",
+          alternativa_sin_tecnologia: "Copia los criterios en el libro o cuaderno del docente y marca con L / P / NL junto a cada nombre.",
+        },
+        "docente"
+      ),
+      mat("ticket_salida", i, {
+        titulo: `Ticket de salida: ${g}`,
+        proposito: "Comprobar al cierre si cada estudiante logró el objetivo de la clase.",
+        preparacion: ["Imprime o recorta un ticket por estudiante (un cuarto de hoja).", "Tiempo estimado: 5 min"],
+        instrucciones_uso: ["Entrega el ticket en los últimos 5 minutos.", "Cada estudiante responde solo y lo entrega al salir.", "Clasifica los tickets en tres montones según el criterio de logro."],
+        contenido: [
+          `TICKET DE SALIDA — ${g}`,
+          "Nombre: ______________________",
+          `Objetivo de hoy: ${objetivoClaseDe(c) || "el objetivo de la clase"}`,
+          "",
+          `1. Escribe o dibuja un ejemplo de ${contenidoDe(inds[0])}.`,
+          `2. ${accionDe(inds[inds.length > 1 ? 1 : 0])}: hazlo en este espacio.`,
+          '3. Completa: "Hoy aprendí que ..."',
+        ].join("\n"),
+        solucionario: [
+          `1. Un ejemplo correcto de ${contenidoDe(inds[0])}.`,
+          `2. Se espera que cumpla el indicador: ${inds[inds.length > 1 ? 1 : 0].i}`,
+          `3. Una frase que mencione ${contenidoDe(inds[0])} con sus palabras.`,
+          "Criterio de logro: 2 o 3 respuestas como se espera = logrado; 1 = parcial; 0 = por lograr (retoma el texto modelo la próxima clase).",
+        ].join("\n"),
+        adecuacion: "Versión con apoyo: solo las preguntas 1 y 3; puede responder dibujando o dictando al docente.",
+        alternativa_sin_tecnologia: "Escribe las 3 preguntas en la pizarra; responden en un trozo de papel con su nombre.",
+      }),
+      mat("recurso_mineduc", i, {
+        titulo: `Recursos Mineduc: ${c.asig?.nombre || ""} ${g}`,
+        proposito: "Profundizar la clase con el programa de estudio y el texto escolar oficial.",
+        momento: "desarrollo",
+        preparacion: ["Abre la página del curso en Currículum Nacional (referencias).", `Busca ${(c.oas || []).map((o) => o.cod).join(", ") || "el OA de la clase"} y revisa sus actividades sugeridas.`, "Tiempo estimado: 15 min"],
+        instrucciones_uso: ["Usa una actividad sugerida del programa como ejemplo extra en el texto modelo.", "Si tienes el texto escolar, indica la página del tema a los estudiantes."],
+        contenido: [
+          `Qué buscar para ${c.asig?.nombre || ""} ${g}:`,
+          `1. Currículum Nacional, página del curso: abre ${(c.oas || []).map((o) => o.cod).join(", ") || "el OA"} y revisa las actividades y ejemplos de evaluación del programa de estudio.`,
+          `2. Textos Escolares: descarga el texto del estudiante de ${g} y busca la unidad de ${contenidoDe(inds[0])}.`,
+          "3. Búsqueda sugerida: videos y recursos del mismo tema para proyectar si tienes conexión.",
+        ].join("\n"),
+        solucionario: "No aplica: es una guía de búsqueda para el docente.",
+        adecuacion: "Elige del texto escolar una página con imágenes para quien necesita apoyo visual.",
+        alternativa_sin_tecnologia: "Usa el texto escolar impreso de la biblioteca o la guía didáctica del docente.",
+      }, "docente")
+    );
+  });
+  const lineas = [];
+  lineas.push(`- Pizarra y plumones: 1 (docente) · inicio: ${multi ? "una fila por curso con su objetivo" : "el objetivo de la clase y los 5 pasos del texto modelo"} · si falta: papelógrafo pegado en el muro.`);
+  cursos.forEach((c, i) => {
+    lineas.push(`- Guías del estudiante ${c.gradoNombre}: ${calcularTotal("por estudiante", 1, n(i))} · desarrollo: práctica en 3 niveles · si falta: copiar los ítems en la pizarra.`);
+    lineas.push(`- Tickets de salida ${c.gradoNombre}: ${calcularTotal("por estudiante", 1, n(i))} · cierre · si falta: responder en papel recortado.`);
+    lineas.push(`- Lista de cotejo ${c.gradoNombre}: 1 (docente) · desarrollo y cierre · si falta: registro en el cuaderno del docente.`);
+  });
+  lineas.push(`- Cuaderno y lápiz grafito: ${calcularTotal("por estudiante", 1, n("todos"))} · desarrollo: responder la guía · si falta: hojas sueltas.`);
+  const concreto = MATERIAL_CONCRETO[cursos[0]?.asig?.id] || MATERIAL_CONCRETO.LEN;
+  lineas.push(`- ${concreto[0]}: ${calcularTotal("por pareja", 1, n("todos"))} · desarrollo: modelaje y ítems básicos de la guía · si falta: ${concreto[1]}.`);
+  textos(String(ctx?.recursos || "").split(/[,;]/)).forEach((r) =>
+    lineas.push(`- ${r} (declarado por el docente): según disponibilidad · desarrollo: úsalo al modelar el texto modelo y en los ítems básicos de la guía · si falta: el material concreto de esta lista.`)
+  );
+  out.push(
+    mat(
+      "materiales_fisicos",
+      "todos",
+      {
+        titulo: "Lista de materiales físicos",
+        proposito: "Tener listo todo lo necesario antes de la clase, con cantidades.",
+        preparacion: ["Revisa la lista y marca lo que ya tienes.", "Imprime guías, tickets y lista de cotejo según las cantidades.", "Deja el material concreto separado por mesa o grupo.", "Tiempo estimado: 15 min"],
+        instrucciones_uso: ["Reparte el material concreto al empezar el desarrollo.", "Nombra un encargado de materiales por mesa para repartir y recoger."],
+        contenido: lineas.join("\n"),
+        solucionario: "No aplica: es una lista de preparación.",
+        adecuacion: "Deja material concreto extra y la copia de los pasos del texto modelo en la mesa de quien necesita apoyo.",
+        alternativa_sin_tecnologia: "Todos los materiales de la lista son físicos; si falta alguno, usa la alternativa indicada en cada línea.",
+      },
+      "docente"
+    )
+  );
+  return out;
+}
+
+const MATERIAL_CONCRETO = {
+  LEN: ["Tarjetas con palabras o imágenes del tema", "palabras escritas en la pizarra"],
+  MAT: ["Material para contar y agrupar (20 fichas, cubos o palitos)", "dibujos de puntos en el cuaderno"],
+  CN: ["Objetos o imágenes para observar (y una lupa si hay)", "dibujos en la pizarra"],
+  HIS: ["Mapa o imágenes impresas del tema", "un dibujo del mapa en la pizarra"],
+  TEC: ["Materiales reciclados: cartón, tijeras y pegamento", "hojas de cuaderno"],
+  ORI: ["Tarjetas con situaciones de la vida escolar", "situaciones leídas en voz alta"],
+};
+
+const DEFECTO = {
+  preparacion: ["Revisa el material completo y ajústalo a tu curso.", "Imprime o copia en la pizarra lo necesario.", "Tiempo estimado: 10 min"],
+  instrucciones_uso: ["Presenta el material y para qué sirve.", "Muestra cómo se usa con un ejemplo.", "Retira o revisa el material al terminar."],
+  solucionario: "No aplica: material de apoyo sin respuestas cerradas.",
+  adecuacion: "Versión con apoyo: la mitad de los pasos o ítems, con un ejemplo resuelto a la vista e instrucciones leídas en voz alta; puede responder oralmente o dibujando.",
+  alternativa_sin_tecnologia: "Sin proyector ni internet: lee o escribe en la pizarra el contenido de este material; los estudiantes trabajan en el cuaderno.",
+};
+
+// Completa un material de la API con el esquema entero. Si una guía, ticket o instrumento viene sin contenido
+// o sin solucionario, se reemplaza por el de respaldo del mismo curso. Devuelve null si no se puede usar.
+export function normalizarMaterial(m, cursos, ctx, respaldo = []) {
+  if (!m || typeof m !== "object") return null;
+  const tipo = String(m.tipo || "sitio").trim().toLowerCase().replace(/\s+/g, "_");
+  const curso = /^\d+$/.test(String(m.curso)) && cursos[+m.curso] ? +m.curso : "todos";
+  const cp = respaldo.find((r) => r.tipo === tipo && r.curso === curso) || respaldo.find((r) => r.tipo === tipo);
+  const sinSol = vacio(m.solucionario) || /^no aplica/i.test(String(m.solucionario));
+  if (cp && (vacio(m.contenido) || (GRADUADOS.includes(tipo) && sinSol))) return cp;
+  const contenido = vacio(m.contenido) ? m.alternativa_sin_tecnologia : m.contenido;
+  if (vacio(contenido)) return null;
+  const base = cp || DEFECTO;
+  const unidad = UNIDADES.includes(m.cantidad?.unidad) ? m.cantidad.unidad : cp?.cantidad.unidad || "por estudiante";
+  const numero = Number(m.cantidad?.numero) > 0 ? Number(m.cantidad.numero) : 1;
+  const lista = (k) => (textos(m[k]).length ? textos(m[k]) : base[k]);
+  const texto = (k) => (vacio(m[k]) ? base[k] : String(m[k]).trim());
+  return {
+    tipo,
+    titulo: String(m.titulo || m.tipo || "Material").trim(),
+    proposito: vacio(m.proposito) ? `Apoya el objetivo de la clase: ${objetivoClaseDe(cursos[curso === "todos" ? 0 : curso] || { oas: [] })}` : String(m.proposito).trim(),
+    momento: MOMENTOS.includes(m.momento) ? m.momento : MOMENTO_DEFECTO[tipo] || "desarrollo",
+    curso,
+    cantidad: { unidad, numero, total: calcularTotal(unidad, numero, estudiantesDe(ctx, cursos, curso)) },
+    preparacion: lista("preparacion"),
+    instrucciones_uso: lista("instrucciones_uso"),
+    contenido: String(contenido).trim(),
+    solucionario: texto("solucionario"),
+    adecuacion: texto("adecuacion"),
+    alternativa_sin_tecnologia: texto("alternativa_sin_tecnologia"),
+    referencias: normalizarReferencias(m.referencias, tipo, cursos[curso === "todos" ? 0 : curso]),
+    link: esHttps(m.link) ? m.link : "",
+  };
+}
+
+// Lista final: materiales de la API normalizados, sin genéricos sueltos, más los tipos mínimos que falten (por curso).
+export function normalizarMateriales(lista, cursos, ctx) {
+  const respaldo = materialesRespaldo(cursos, ctx);
+  const genericos = /^(pizarra|cuadernos?|recursos propios)$/i;
+  const api = (Array.isArray(lista) ? lista : [])
+    .filter((m) => m && !genericos.test(String(m.titulo || m.tipo || "").trim()))
+    .map((m) => normalizarMaterial(m, cursos, ctx, respaldo))
+    .filter((m, i, a) => m && a.indexOf(m) === i);
+  const falta = respaldo.filter((r) => !api.some((m) => m.tipo === r.tipo && (r.curso === "todos" || m.curso === r.curso)));
+  const orden = (m) => (m.curso === "todos" ? 99 : m.curso) * 100 + (TIPOS_MINIMOS.includes(m.tipo) ? TIPOS_MINIMOS.indexOf(m.tipo) : 50);
+  return [...api, ...falta].sort((a, b) => orden(a) - orden(b)).map((m, i) => ({ ...m, id: `m${i + 1}` }));
 }
 
 export function planRespaldo(cursos, bloques, ctx, multigrado) {
@@ -469,17 +821,10 @@ export function planRespaldo(cursos, bloques, ctx, multigrado) {
       ],
     },
     evaluacion: {
-      instrumento: "Lista de cotejo con los objetivos seleccionados, más registro anecdótico del docente.",
-      porCurso: cursos.map(() => ({
-        criterios: ["Cumple el objetivo con apoyo", "Cumple el objetivo de forma autónoma", "Participa y respeta los acuerdos"],
-      })),
+      instrumento: "Lista de cotejo con los indicadores de la clase (Logrado / Parcial / No logrado) y ticket de salida.",
+      porCurso: cursos.map((c) => ({ criterios: criteriosDe(c) })),
     },
-    materiales: [
-      { tipo: "Ficha de trabajo", descripcion: "Ítems para practicar el objetivo de la clase.", contenido: fichaBasica(cursos) },
-      { tipo: "Pizarra", descripcion: "Para escribir los objetivos y organizar el trabajo por curso.", contenido: "" },
-      { tipo: "Cuadernos", descripcion: "Registro individual de cada estudiante.", contenido: "" },
-      { tipo: "Recursos propios", descripcion: ctx.recursos || "Los que tengas disponibles en el aula.", contenido: "" },
-    ],
+    materiales: normalizarMateriales([], cursos, ctx),
     tutoria: multigrado
       ? "Se forman parejas de apadrinamiento: un estudiante de un curso más avanzado acompaña a uno de un curso menor durante el trabajo autónomo, sin resolverle la tarea."
       : "",
@@ -510,9 +855,14 @@ export function planTexto(p) {
     L.push(`\n## ${c.gradoNombre.toUpperCase()} — ${c.asig}`);
     (c.oas || []).forEach((o) => {
       L.push(`${o.cod} (${o.basal ? "basal" : "complementario"}): ${o.texto}`);
+      if (o.fuente) L.push(`  Origen: ${o.fuente}${o.url ? ` · ${o.url}` : ""}`);
       (o.indicadores || []).forEach((x) => L.push(`  Indicador: ${x.i} (habilidad: ${x.h}; contenido: ${x.c}; actitud: ${x.a})`));
     });
   });
+  if (p.alineacion?.length) {
+    L.push(`\n## Alineación sugerida (revisar)`);
+    p.alineacion.forEach((x) => L.push(`- ${p.meta.cursos[x.curso]?.gradoNombre || "Curso"} · ${x.oa}: actividad — ${x.actividad}; evidencia — ${x.evidencia}`));
+  }
   L.push(`\n## Inicio (${p.inicio.min} min)`);
   L.push(`Estudiantes:`);
   (p.inicio.estudiantes || []).forEach((x) => L.push(`- ${x}`));
@@ -534,6 +884,7 @@ export function planTexto(p) {
     L.push(`Docente:`);
     (pc.docente || []).forEach((x) => L.push(`- ${x}`));
   });
+  (p.desarrollo.rotaciones || []).forEach((r) => L.push(`- Rotación ${r.desde}–${r.hasta} min · ${r.curso}: docente — ${r.docente}; demás cursos — ${r.otros}`));
   L.push(`\n## Cierre (${p.cierre.min} min)`);
   L.push(`Estudiantes:`);
   (p.cierre.estudiantes || []).forEach((x) => L.push(`- ${x}`));
@@ -557,9 +908,25 @@ export function planTexto(p) {
   L.push(`\n## Adecuaciones`);
   (p.adecuaciones || []).forEach((x) => L.push(`- ${x}`));
   L.push(`\n## Materiales`);
-  (p.materiales || []).forEach((m) => {
-    L.push(`- ${m.tipo}: ${m.descripcion}${m.link ? ` (${m.link})` : ""}`);
-    if (m.contenido) L.push(m.contenido.split("\n").map((x) => `    ${x}`).join("\n"));
-  });
+  (p.materiales || []).forEach((m) => L.push(`\n${materialTexto(m, p.meta.cursos)}`));
+  return L.join("\n");
+}
+
+// Un material en texto (copiar, descargar o imprimir). Acepta también el formato antiguo {tipo, descripcion, contenido, link}.
+export function materialTexto(m, cursosMeta) {
+  const L = [`### ${m.titulo || m.tipo}${m.proposito || m.descripcion ? ": " + (m.proposito || m.descripcion) : ""}`];
+  const curso = m.curso === "todos" ? "todos los cursos" : cursosMeta?.[m.curso]?.gradoNombre;
+  const datos = [m.momento && `Momento: ${m.momento}`, curso && (cursosMeta || []).length > 1 && `Curso: ${curso}`, m.cantidad?.total && `Cantidad: ${m.cantidad.total}`].filter(Boolean);
+  if (datos.length) L.push(datos.join(" · "));
+  const lista = (t, xs) => (xs || []).length && L.push(`${t}:`, ...xs.map((x) => `- ${x}`));
+  const bloque = (t, x) => x && L.push(`${t}:`, x);
+  lista("Preparación previa", m.preparacion);
+  lista("Cómo se usa en la sala", m.instrucciones_uso);
+  bloque("Contenido", m.contenido);
+  bloque("Para el docente, solucionario (revisar antes de imprimir)", m.solucionario);
+  bloque("Adecuación NEE", m.adecuacion);
+  bloque("Alternativa sin tecnología", m.alternativa_sin_tecnologia);
+  lista("Referencias", (m.referencias || []).map((r) => `[${ETIQUETA_LINK[r.tipo_link] || r.tipo_link}] ${r.titulo}: ${r.url}`));
+  if (m.link) L.push(`Link del docente: ${m.link}`);
   return L.join("\n");
 }

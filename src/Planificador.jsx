@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 import {
   GRADOS,
+  OA_DATA,
   nombreGrado,
   ASIGNATURAS,
   listaOA,
@@ -13,22 +14,27 @@ import {
   necesitaFetch,
   planRespaldo,
   planTexto,
+  objetivoClaseDe,
+  normalizarMateriales,
+  materialTexto,
+  esHttps,
+  ETIQUETA_LINK,
 } from "./curriculo.js";
+import { PORTALES, PAGINA_ASIGNATURA } from "./recursos.js";
 import AdSlot from "./AdSlot.jsx";
 
 const ADSENSE_SLOT_PLANIFICADOR = import.meta.env.VITE_ADSENSE_SLOT_PLANIFICADOR || "";
 
-// En Claude se llama directo a la API. En desarrollo local, index.html define
-// window.__API_URL__ = "/v1/messages" para pasar por el proxy de Vite.
-const API_URL = (typeof window !== "undefined" && window.__API_URL__) || "https://api.anthropic.com/v1/messages";
+// En desarrollo lo reenvía Vite; en producción, la función del servidor.
+const API_URL = (typeof window !== "undefined" && window.__API_URL__) || "/api/messages";
 
-async function llamarClaude(prompt) {
+async function llamarClaude(prompt, maxTokens = 1500) {
   const res = await fetch(API_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "claude-sonnet-4-6",
-      max_tokens: 1200,
+      max_tokens: maxTokens,
       messages: [{ role: "user", content: prompt }],
     }),
   });
@@ -40,10 +46,9 @@ async function llamarClaude(prompt) {
     .join("\n");
 }
 
-const COLORES = ["#4F46E5", "#059669", "#D97706", "#9333EA"];
-const COLORES_BG = ["#EEF2FF", "#ECFDF5", "#FFFBEB", "#FAF5FF"];
-const colorDe = (i) => COLORES[i % COLORES.length];
-const bgDe = (i) => COLORES_BG[i % COLORES_BG.length];
+// Colores por curso definidos en estilos.css (claro, oscuro e impresión).
+const colorDe = (i) => `var(--curso${i % 4})`;
+const bgDe = (i) => `var(--curso${i % 4}-bg)`;
 
 /* ============================================================
    COMPONENTE PRINCIPAL
@@ -57,18 +62,29 @@ export default function Planificador({ onVolver }) {
     estudiantes: "",
     recursos: "",
     nee: "",
+    foco: "",
+    previos: "",
   });
   const [ctxAbierto, setCtxAbierto] = useState(false);
   const [overrides, setOverrides] = useState({});
   const [extras, setExtras] = useState([]);
   const [rieles, setRieles] = useState([rielVacio(GRADOS[0].id)]);
   const [oaCache, setOaCache] = useState({});
+  const [oaFuentes, setOaFuentes] = useState({});
   const [oaCargando, setOaCargando] = useState({});
   const [indCache, setIndCache] = useState({});
   const [indCargando, setIndCargando] = useState({});
   const [indSel, setIndSel] = useState({}); // { [oaId]: [índices de indicadores elegidos] }
   const [bloques, setBloques] = useState(2);
   const [plan, setPlan] = useState(null);
+  const [planGuardadoId, setPlanGuardadoId] = useState(null);
+  const [editandoPlan, setEditandoPlan] = useState(false);
+  const [unidad, setUnidad] = useState(null);
+  const [unidadGuardadaId, setUnidadGuardadaId] = useState(null);
+  const [unidadesGuardadas, setUnidadesGuardadas] = useState([]);
+  const [sesionesUnidad, setSesionesUnidad] = useState(4);
+  const [generandoUnidad, setGenerandoUnidad] = useState(false);
+  const [vistaResultado, setVistaResultado] = useState("clase");
   const [generando, setGenerando] = useState(false);
   const [aviso, setAviso] = useState("");
   const [guardadas, setGuardadas] = useState([]);
@@ -84,6 +100,8 @@ export default function Planificador({ onVolver }) {
           if (v.ctx) setCtx((c) => ({ ...c, ...v.ctx }));
           if (v.overrides) setOverrides(v.overrides);
           if (v.extras) setExtras(v.extras);
+          if (Array.isArray(v.rieles) && v.rieles.length > 0 && v.rieles.length <= 4 && v.rieles.every((x) => x && GRADOS.some((g) => g.id === x.grado) && ASIGNATURAS.some((a) => a.id === x.asig) && Array.isArray(x.oaIds))) setRieles(v.rieles);
+          if (v.bloques === 1 || v.bloques === 2) setBloques(v.bloques);
         }
       } catch (e) {
         /* primera vez: no hay configuración guardada */
@@ -93,6 +111,12 @@ export default function Planificador({ onVolver }) {
         if (r && r.value) setGuardadas(JSON.parse(r.value));
       } catch (e) {
         /* sin planificaciones guardadas */
+      }
+      try {
+        const r = await window.storage.get("planificador:unidades");
+        if (r && r.value) setUnidadesGuardadas(JSON.parse(r.value));
+      } catch (e) {
+        /* sin unidades guardadas */
       }
     })();
   }, []);
@@ -105,10 +129,29 @@ export default function Planificador({ onVolver }) {
     }
   }, []);
 
+  // Al imprimir la planificación se abren los <details> (solucionario, adecuación, alternativa) y después se cierran de nuevo.
   useEffect(() => {
-    const id = setTimeout(() => guardarConfig({ ctx, overrides, extras }), 600);
+    let abiertos = [];
+    const abrir = () => {
+      abiertos = [...document.querySelectorAll(".plan details:not([open])")];
+      abiertos.forEach((d) => (d.open = true));
+    };
+    const cerrar = () => {
+      abiertos.forEach((d) => (d.open = false));
+      abiertos = [];
+    };
+    window.addEventListener("beforeprint", abrir);
+    window.addEventListener("afterprint", cerrar);
+    return () => {
+      window.removeEventListener("beforeprint", abrir);
+      window.removeEventListener("afterprint", cerrar);
+    };
+  }, []);
+
+  useEffect(() => {
+    const id = setTimeout(() => guardarConfig({ ctx, overrides, extras, rieles, bloques }), 600);
     return () => clearTimeout(id);
-  }, [ctx, overrides, extras, guardarConfig]);
+  }, [ctx, overrides, extras, rieles, bloques, guardarConfig]);
 
   /* ---------- OA por riel ---------- */
   const oasPorRiel = useMemo(
@@ -136,8 +179,10 @@ Entrega entre 8 y 16 objetivos.`;
       const arr = JSON.parse(limpiarJSON(txt));
       if (!Array.isArray(arr) || !arr.length) throw new Error("respuesta vacía");
       setOaCache((c) => ({ ...c, [key]: arr.map((o) => [o.n, o.texto, o.basal ? 1 : 0, o.eje || "General"]) }));
+      setOaFuentes((c) => ({ ...c, [key]: "ia" }));
     } catch (e) {
       setOaCache((c) => ({ ...c, [key]: oaFallback(asigNombre, gradoNom) }));
+      setOaFuentes((c) => ({ ...c, [key]: "provisional" }));
       setAviso(`No se pudieron cargar los objetivos en línea para ${asigNombre} · ${gradoNom}. Se muestran objetivos provisionales editables.`);
     } finally {
       setOaCargando((c) => ({ ...c, [key]: false }));
@@ -183,6 +228,14 @@ Responde SOLO con un arreglo JSON, sin texto previo ni posterior, sin markdown:
   const filtrados = (idx) => {
     const f = rieles[idx].filtro;
     return oasPorRiel[idx].filter((o) => (f === "todos" ? true : f === "basal" ? o.basal : !o.basal));
+  };
+
+  const fuenteOA = (oa, r) => {
+    const url = PAGINA_ASIGNATURA[r.asig]?.porCurso(r.grado);
+    if (oa.propio) return { tipo: "propio", etiqueta: "Agregado por el docente", url };
+    if (OA_DATA[r.asig]?.[r.grado]) return { tipo: "oficial", etiqueta: "Currículum Nacional · base curada", url };
+    if (oaFuentes[`${r.asig}-${r.grado}`] === "provisional") return { tipo: "provisional", etiqueta: "Provisional · reemplazar por el OA oficial", url };
+    return { tipo: "ia", etiqueta: "Sugerido por IA · verificar", url };
   };
 
   /* ---------- edición de rieles ---------- */
@@ -234,22 +287,29 @@ Responde SOLO con un arreglo JSON, sin texto previo ni posterior, sin markdown:
           .filter(Boolean)
           .map((o) => ({
             ...o,
+            ...fuenteOA(o, r),
             indicadores: indCache[o.id] || null,
             indElegidos: (indCache[o.id] || []).filter((_, k) => (indSel[o.id] || []).includes(k)),
           })),
       })),
-    [rieles, oasPorRiel, indCache, indSel]
+    [rieles, oasPorRiel, indCache, indSel, oaFuentes]
   );
 
-  const generar = async () => {
+  const generar = async (ajuste = "") => {
     if (!listo) return;
+    setEditandoPlan(false);
+    setPlanGuardadoId(null);
+    setVistaResultado("clase");
     setGenerando(true);
     setAviso("");
     const t = TIEMPOS[bloques];
     const contexto = `${multigrado ? `Aula multigrado con ${cursos.length} cursos combinados en la misma sala` : "Clase de un solo curso"} en Chile.
 Estudiantes: ${ctx.estudiantes || "curso completo"}.
 Recursos disponibles: ${ctx.recursos || "material concreto básico, pizarra, cuadernos"}.
-Diversificación requerida: ${ctx.nee || "estudiantes con distintos ritmos de aprendizaje"}.`;
+Diversificación requerida: ${ctx.nee || "estudiantes con distintos ritmos de aprendizaje"}.
+Foco de la clase: ${ctx.foco || "aprendizaje equilibrado de los objetivos seleccionados"}.
+Conocimientos previos: ${ctx.previos || "considéralos heterogéneos y explóralos al inicio"}.
+${ajuste ? `Ajuste solicitado para esta nueva versión: ${ajuste}.` : ""}`;
 
     const listaOAsTexto = (c) =>
       c.oas
@@ -276,63 +336,96 @@ Diseña la clase con inicio, desarrollo y cierre. En cada momento separa dos cos
       multigrado
         ? "Los momentos comunes son para todos los cursos juntos; 'porCurso' trae el trabajo diferenciado simultáneo, un elemento por curso, en el mismo orden en que aparecen arriba."
         : "Es una clase para un solo curso: usa los campos comunes para lo que se hace con todo el curso y deja 'porCurso' con un único elemento con la secuencia principal de la clase."
-    } Integra los distintos objetivos seleccionados de cada curso, no solo uno. Sé concreto: nombra la actividad y el material. Cada punto en máximo 25 palabras.
+    } Integra los distintos objetivos seleccionados de cada curso, no solo uno. Sé concreto: nombra la actividad y el material. Cada punto en máximo 25 palabras. Para multigrado, reparte el desarrollo en tramos consecutivos: los minutos empiezan en 0 y terminan exactamente en ${t.desarrollo}; en cada tramo indica a qué curso atiende el docente y qué hacen los demás.
 
-Además, redacta el objetivo de la clase de cada curso: una frase breve dirigida a los estudiantes (por ejemplo "Hoy aprenderemos a..."), que priorice los indicadores elegidos por el docente cuando existan, o resuma los OA del curso si no hay ninguno elegido. Un objetivo por curso, en el mismo orden en que aparecen arriba.
+Además, redacta el objetivo de la clase de cada curso: una frase breve dirigida a los estudiantes (por ejemplo "Hoy aprenderemos a..."), que priorice los indicadores elegidos por el docente cuando existan, o resuma los OA del curso si no hay ninguno elegido. Un objetivo por curso, en el mismo orden en que aparecen arriba. Incluye una alineación por cada OA: nombra una actividad concreta donde se trabaja y la evidencia observable que permitirá evaluar su logro. No omitas OA.
 
 Responde SOLO JSON, sin markdown:
 {"titulo":"título de la clase, máx 10 palabras","hilo":"situación o tema que articula la clase, máx 30 palabras","objetivosClase":[${cursos
       .map(() => '"objetivo de la clase de este curso, en lenguaje para estudiantes, máx 25 palabras"')
-      .join(",")}],"inicio":{"min":${t.inicio},"estudiantes":["3 a 4 acciones que hacen los estudiantes"],"docente":["3 a 4 orientaciones de qué hacer y cómo"],"pregunta":"pregunta motivadora"},"desarrollo":{"min":${t.desarrollo},"comunEstudiantes":[${multigrado ? '"acciones de todos los cursos juntos"' : '"vacío, no aplica a un solo curso"'}],"comunDocente":[${
+      .join(",")}],"alineacion":[${cursos.flatMap((c, i) => c.oas.map((o) => `{"curso":${i},"oa":"${o.cod}","actividad":"actividad concreta","evidencia":"evidencia observable"}`)).join(",")}],"inicio":{"min":${t.inicio},"estudiantes":["3 a 4 acciones que hacen los estudiantes"],"docente":["3 a 4 orientaciones de qué hacer y cómo"],"pregunta":"pregunta motivadora"},"desarrollo":{"min":${t.desarrollo},"comunEstudiantes":[${multigrado ? '"acciones de todos los cursos juntos"' : '"vacío, no aplica a un solo curso"'}],"comunDocente":[${
       multigrado ? '"orientaciones para el momento común, incluida la rotación de atención del docente"' : '"vacío, no aplica a un solo curso"'
-    }],"porCurso":[${cursos
+    }],"rotaciones":[${multigrado ? cursos.map((c, i) => `{"desde":${Math.round(t.desarrollo * i / cursos.length)},"hasta":${Math.round(t.desarrollo * (i + 1) / cursos.length)},"curso":"${c.gradoNombre}","docente":"atención directa a ${c.gradoNombre}","otros":"trabajo autónomo breve con instrucciones visibles"}`).join(",") : ""}],"porCurso":[${cursos
       .map(() => '{"estudiantes":["3 a 4 acciones concretas del estudiante"],"docente":["3 a 4 orientaciones de qué hacer y cómo, incluido el manejo de este grupo"]}')
       .join(",")}]},"cierre":{"min":${t.cierre},"estudiantes":["2 a 3 acciones de los estudiantes"],"docente":["2 a 3 orientaciones de qué hacer y cómo"],"metacognicion":["3 preguntas para los estudiantes"]}}`;
 
     const promptB = `${encabezado}
 
-Entrega los apoyos de la clase: diversificación DUA, evaluación formativa por curso, materiales necesarios${
+Entrega los apoyos de la clase: diversificación DUA${
       multigrado ? ", tutoría entre pares propia del multigrado" : ""
-    } y adecuaciones. No inventes enlaces ni URLs.
-
-Para cada material, entrega su contenido completo y listo para usar (por ejemplo los ítems de una ficha o guía, las preguntas de una lista, un texto breve de lectura, o una pauta de evaluación) cuando sea algo que se pueda redactar directamente; si en cambio es un recurso externo real que el docente debe buscar o ya tiene (un video, un sitio web, un cuento físico del aula, un software), deja el contenido como string vacío y el docente agregará el link. Incluye al menos un material con contenido generado. Cada punto en máximo 20 palabras, salvo el contenido de los materiales.
+    } y adecuaciones. No inventes enlaces ni URLs. Cada punto en máximo 20 palabras.
 
 Responde SOLO JSON, sin markdown:
-{"dua":{"representacion":["3 medidas"],"accion":["3 medidas"],"motivacion":["3 medidas"]},"evaluacion":{"instrumento":"instrumento concreto","porCurso":[${cursos
-      .map(() => '{"criterios":["3 criterios observables, derivados de los objetivos de este curso"]}')
-      .join(",")}]},"materiales":[{"tipo":"tipo de material, 2 a 4 palabras","descripcion":"para qué se usa en la clase, máx 18 palabras","contenido":"contenido completo listo para usar en texto plano con saltos de línea, o string vacío si es un recurso externo"}],"tutoria":"${
+{"dua":{"representacion":["3 medidas"],"accion":["3 medidas"],"motivacion":["3 medidas"]},"tutoria":"${
       multigrado ? "cómo se organiza el apoyo entre los cursos, máx 35 palabras" : "deja este campo como string vacío porque la clase es de un solo curso"
     }","adecuaciones":["3 adecuaciones para estudiantes que requieren más apoyo"]}`;
 
-    let nucleo = null;
-    let apoyos = null;
-    try {
-      const [ra, rb] = await Promise.all([llamarClaude(promptA), llamarClaude(promptB)]);
+    // Materiales y evaluación: una llamada por curso para que el JSON no se trunque en multigrado.
+    const promptC = (c) => `${encabezado}
+
+Prepara los MATERIALES de la clase para ${c.gradoNombre} (${c.asig.nombre}), completos y listos para imprimir, sin nada que el docente deba completar o interpretar. Objetivo de la clase de este curso: ${objetivoClaseDe(c)}
+
+Entrega como mínimo estos 6 materiales, en este orden:
+1. guia_estudiante: encabezado Nombre/Curso/Fecha, instrucciones y 4 a 8 ítems numerados en 3 niveles (básico, intermedio, desafío), cada uno ligado a un indicador. Solucionario ítem por ítem.
+2. texto_modelo: el texto, el problema resuelto o el ejemplo que el docente modela, completo.
+3. instrumento_evaluacion: lista de cotejo (Logrado / Parcial / No logrado) o rúbrica de 3 a 4 niveles (Logrado / Medianamente logrado / Por lograr / No observado) con un descriptor por nivel; sus criterios son exactamente los de "criterios". Solucionario: qué evidencia observar en cada criterio.
+4. ticket_salida: 2 o 3 preguntas; solucionario con la respuesta esperada de cada una y el criterio de logro (por ejemplo "2 de 3 correctas = logrado").
+5. materiales_fisicos: en "contenido", una línea por ítem con cantidad total, momento de uso, para qué se usa y alternativa si falta.${
+      ctx.recursos ? ` Incluye con un uso concreto cada recurso declarado por el docente: ${ctx.recursos}.` : ""
+    } "Pizarra", "Cuadernos" o "Recursos propios" nunca van como materiales sueltos: son ítems de esta lista.
+6. recurso_mineduc: qué buscar en los portales Mineduc para esta clase.
+Puedes agregar un video, sitio, software o cuento si aporta; su "contenido" es el guion completo que lo reemplaza (el texto del cuento o su resumen, la explicación del video, los pasos de la actividad).
+
+Reglas: ningún campo vacío. "adecuacion" trae ítems o pasos concretos para estudiantes con NEE, no un consejo. "alternativa_sin_tecnologia" es contenido equivalente completo si no hay proyector ni internet. En "referencias", para un recurso externo propone una url directa https; para portales Mineduc NO escribas la url: usa {"id":"..."} con uno de estos ids: ${PORTALES.map((p) => `${p.id} = ${p.nombre}`).join("; ")}.
+
+Responde SOLO JSON, sin markdown:
+{"instrumento":"nombre del instrumento, máx 12 palabras","criterios":["3 a 4 criterios observables, derivados de los indicadores de este curso"],"materiales":[{"tipo":"guia_estudiante | texto_modelo | instrumento_evaluacion | ticket_salida | materiales_fisicos | recurso_mineduc | video | sitio | software | cuento","titulo":"título breve","proposito":"para qué sirve, ligado al objetivo, máx 20 palabras","momento":"inicio | desarrollo | cierre","cantidad":{"unidad":"por estudiante | por grupo | por pareja | docente","numero":1},"preparacion":["pasos del docente antes de la clase","tiempo estimado: N min"],"instrucciones_uso":["cómo se entrega y se usa en la sala, paso a paso"],"contenido":"texto completo listo para imprimir, con saltos de línea","solucionario":"respuestas esperadas ítem por ítem, o 'No aplica: motivo'","adecuacion":"versión reducida o con apoyo","alternativa_sin_tecnologia":"contenido equivalente","referencias":[{"fuente":"YouTube","titulo":"...","url":"https://..."},{"id":"textos"}]}]}`;
+
+    const leer = (r) => {
+      if (r.status !== "fulfilled") return null;
       try {
-        nucleo = JSON.parse(limpiarJSON(ra));
+        return JSON.parse(limpiarJSON(r.value));
       } catch (e) {
-        nucleo = null;
+        return null;
       }
-      try {
-        apoyos = JSON.parse(limpiarJSON(rb));
-      } catch (e) {
-        apoyos = null;
-      }
-    } catch (e) {
-      /* sin conexión al servicio: se usa el plan de respaldo */
+    };
+  const [ra, rb, ...rc] = await Promise.allSettled([
+      llamarClaude(promptA, 3000),
+      llamarClaude(promptB, 1500),
+      ...cursos.map((c) => llamarClaude(promptC(c), 6000)),
+    ]);
+    const nucleo = leer(ra);
+    const alineacion = Array.isArray(nucleo?.alineacion) ? nucleo.alineacion.filter((x) => x && Number.isInteger(x.curso) && cursos[x.curso]?.oas.some((o) => o.cod === x.oa) && typeof x.actividad === "string" && typeof x.evidencia === "string") : [];
+    if (nucleo) {
+      nucleo.alineacion = alineacion;
+      if (nucleo.desarrollo) nucleo.desarrollo.rotaciones = Array.isArray(nucleo.desarrollo.rotaciones) ? nucleo.desarrollo.rotaciones.filter((x) => x && Number.isFinite(x.desde) && Number.isFinite(x.hasta) && x.desde >= 0 && x.hasta <= t.desarrollo && x.hasta > x.desde && typeof x.curso === "string" && typeof x.docente === "string" && typeof x.otros === "string") : [];
     }
+    const apoyos = leer(rb);
+    const mats = rc.map(leer);
 
     const base = planRespaldo(cursos, bloques, ctx, multigrado);
-    const materialesFinal = ((apoyos && apoyos.materiales) || base.materiales).map((m) => ({
-      tipo: m.tipo,
-      descripcion: m.descripcion,
-      contenido: m.contenido || "",
-      link: "",
-    }));
+    // Si falla la llamada de materiales de un curso, ese curso usa los de respaldo (normalizarMateriales completa lo que falte).
+    const materialesFinal = normalizarMateriales(
+      mats.flatMap((r, i) => (r && Array.isArray(r.materiales) ? r.materiales.map((m) => ({ ...m, curso: i })) : [])),
+      cursos,
+      ctx
+    );
+    // Criterios de la API solo si son un arreglo y el instrumento de ese curso no se reemplazó por el de respaldo
+    // (si no, la tarjeta de evaluación y la lista de cotejo mostrarían criterios distintos).
+    const instDe = (i) => materialesFinal.find((m) => m.tipo === "instrumento_evaluacion" && m.curso === i)?.contenido || "";
+    const evaluacion = {
+      instrumento: mats.find((r) => r && r.instrumento)?.instrumento || base.evaluacion.instrumento,
+      porCurso: cursos.map((_, i) => {
+        const api = Array.isArray(mats[i]?.criterios) ? mats[i].criterios.map(String).filter((x) => x.trim()) : [];
+        const respaldo = base.evaluacion.porCurso[i].criterios;
+        return { criterios: api.length && !respaldo.every((x) => instDe(i).includes(x)) ? api : respaldo };
+      }),
+    };
     const final = {
       ...base,
-      ...(nucleo || {}),
-      ...(apoyos || {}),
+      // Los campos que la API devuelve en null no pisan los de respaldo.
+      ...Object.fromEntries(Object.entries({ ...(nucleo || {}), ...(apoyos || {}) }).filter(([, v]) => v != null)),
+      evaluacion,
       materiales: materialesFinal,
       meta: {
         bloques,
@@ -344,22 +437,91 @@ Responde SOLO JSON, sin markdown:
         cursos: cursos.map((c) => ({
           gradoNombre: c.gradoNombre,
           asig: c.asig.nombre,
-          oas: c.oas.map((o) => ({ cod: o.cod, basal: o.basal, texto: o.texto, indicadores: o.indicadores })),
+          oas: c.oas.map((o) => ({ cod: o.cod, basal: o.basal, texto: o.texto, indicadores: o.indicadores, fuente: o.etiqueta, url: o.url, fuenteTipo: o.tipo })),
         })),
       },
     };
     if (!nucleo || !apoyos) {
       setAviso("La clase se armó con la estructura base porque el servicio no respondió completo. Puedes volver a crearla.");
+    } else if (mats.some((r) => !r)) {
+      const sin = cursos.filter((_, i) => !mats[i]).map((c) => c.gradoNombre);
+      setAviso(`Los materiales de ${sin.join(", ")} se armaron con la versión base porque el servicio no respondió completo. El resto de la clase sí se generó.`);
     }
     setPlan(final);
     setGenerando(false);
     setTimeout(() => {
       const el = document.getElementById("plan-clase");
-      if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+      if (el) el.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
     }, 80);
   };
 
+  const generarUnidad = async () => {
+    if (!listo || generandoUnidad) return;
+    setGenerandoUnidad(true);
+    setAviso("");
+    const objetivos = cursos.flatMap((c, curso) => c.oas.map((o) => ({ curso, codigo: o.cod, basal: o.basal, texto: o.texto })));
+    const prompt = `Eres especialista en planificación docente chilena. Diseña una unidad coherente de ${sesionesUnidad} clases de ${TIEMPOS[bloques].total} minutos cada una para estos cursos y objetivos seleccionados.\n\nCONTEXTO: ${multigrado ? "aula multigrado" : "curso único"}; foco: ${ctx.foco || "aprendizaje equilibrado"}; conocimientos previos: ${ctx.previos || "heterogéneos"}; recursos: ${ctx.recursos || "pizarra, cuadernos y material concreto básico"}; diversificación: ${ctx.nee || "distintos ritmos de aprendizaje"}.\n\nOA DISPONIBLES (respeta exactamente curso y código):\n${objetivos.map((o) => `[curso ${o.curso}, ${o.codigo}, ${o.basal ? "basal" : "complementario"}] ${o.texto}`).join("\n")}\n\nOrdena las clases desde activación/diagnóstico hasta práctica, aplicación y cierre. Distribuye todos los OA seleccionados a lo largo de la unidad, priorizando los basales. Puedes retomar un OA en más de una clase. Cada clase debe tener objetivo breve, referencias OA exactas, actividades concretas diferenciadas por curso, evidencia observable e instrumento formativo. Incluye una evaluación final coherente con los OA. En multigrado, cada sesión debe proponer una actividad por curso y un momento común cuando aporte. No inventes ni cambies códigos OA.\n\nResponde solo JSON, sin markdown:\n{"titulo":"título de la unidad","proposito":"propósito de aprendizaje","pregunta_esencial":"pregunta que articula la unidad","clases":[{"numero":1,"objetivo":"objetivo de esta clase","oas":[{"curso":0,"codigo":"OA 1"}],"actividades":[{"curso":0,"estudiantes":"qué harán los estudiantes","docente":"qué hará el docente"}],"evidencia":"evidencia observable","evaluacion":"estrategia formativa breve"}],"evaluacion_final":"producto o desempeño final y criterios principales"}`;
+    try {
+      const respuesta = JSON.parse(limpiarJSON(await llamarClaude(prompt, 4500)));
+      const clases = (Array.isArray(respuesta.clases) ? respuesta.clases : []).filter((clase) => clase && typeof clase === "object").slice(0, sesionesUnidad).map((clase, i) => ({
+        numero: i + 1,
+        objetivo: typeof clase.objetivo === "string" ? clase.objetivo : "",
+        oas: Array.isArray(clase.oas) ? clase.oas.filter((o) => Number.isInteger(o.curso) && cursos[o.curso]?.oas.some((oa) => oa.cod === o.codigo)).map(({ curso, codigo }) => ({ curso, codigo })) : [],
+        actividades: Array.isArray(clase.actividades) ? clase.actividades.filter((a) => Number.isInteger(a.curso) && cursos[a.curso] && typeof a.estudiantes === "string" && typeof a.docente === "string").map(({ curso, estudiantes, docente }) => ({ curso, estudiantes, docente })) : [],
+        evidencia: typeof clase.evidencia === "string" ? clase.evidencia : "",
+        evaluacion: typeof clase.evaluacion === "string" ? clase.evaluacion : "",
+      }));
+      if (!clases.length) throw new Error("La respuesta no incluyó clases válidas.");
+      const nueva = {
+        titulo: typeof respuesta.titulo === "string" ? respuesta.titulo : "Unidad de aprendizaje",
+        proposito: typeof respuesta.proposito === "string" ? respuesta.proposito : "",
+        pregunta: typeof respuesta.pregunta_esencial === "string" ? respuesta.pregunta_esencial : "",
+        evaluacionFinal: typeof respuesta.evaluacion_final === "string" ? respuesta.evaluacion_final : "",
+        clases,
+        sesionesSolicitadas: sesionesUnidad,
+        cursos: cursos.map((c) => ({ gradoNombre: c.gradoNombre, asig: c.asig.nombre, oas: c.oas.map((o) => ({ cod: o.cod, texto: o.texto, basal: o.basal })) })),
+        minutosPorClase: TIEMPOS[bloques].total,
+      };
+      const cubiertos = new Set(clases.flatMap((c) => c.oas.map((o) => `${o.curso}|${o.codigo}`)));
+      const faltantesOA = objetivos.filter((o) => !cubiertos.has(`${o.curso}|${o.codigo}`)).length;
+      const faltanActividades = clases.reduce((n, c) => n + cursos.filter((_, i) => !c.actividades.some((a) => a.curso === i)).length, 0);
+      setUnidad(nueva);
+      setUnidadGuardadaId(null);
+      setVistaResultado("unidad");
+      const advertencias = [faltantesOA && `${faltantesOA} OA sin asignar`, faltanActividades && `${faltanActividades} actividades por curso sin definir`, clases.length < sesionesUnidad && `${clases.length} de ${sesionesUnidad} clases generadas`].filter(Boolean);
+      setAviso(advertencias.length ? `Unidad creada con puntos pendientes: ${advertencias.join("; ")}.` : "Unidad creada. Revisa la cobertura de OA y la secuencia antes de usarla.");
+      setTimeout(() => document.getElementById("plan-unidad")?.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" }), 80);
+    } catch (e) {
+      setAviso("No se pudo generar la unidad. Revisa la conexión con el servicio e inténtalo otra vez.");
+    } finally {
+      setGenerandoUnidad(false);
+    }
+  };
+
   const actualizarLinkMaterial = (i, link) => setPlan((p) => ({ ...p, materiales: p.materiales.map((m, idx) => (idx === i ? { ...m, link } : m)) }));
+  const actualizarMaterial = (i, campo, valor) => setPlan((p) => ({ ...p, materiales: p.materiales.map((m, idx) => (idx === i ? { ...m, [campo]: valor } : m)) }));
+  const actualizarFase = (fase, campo, valor) => setPlan((p) => ({ ...p, [fase]: { ...p[fase], [campo]: valor } }));
+  const actualizarListaFase = (fase, campo, valor) => actualizarFase(fase, campo, valor.split("\n").map((x) => x.trim()).filter(Boolean));
+  const actualizarListaCurso = (fase, idx, campo, valor) => setPlan((p) => ({
+    ...p,
+    [fase]: {
+      ...p[fase],
+      porCurso: p[fase].porCurso.map((c, i) => i === idx ? { ...c, [campo]: valor.split("\n").map((x) => x.trim()).filter(Boolean) } : c),
+    },
+  }));
+  const actualizarCriterios = (idx, valor) => setPlan((p) => ({
+    ...p,
+    evaluacion: { ...p.evaluacion, porCurso: p.evaluacion.porCurso.map((c, i) => i === idx ? { ...c, criterios: valor.split("\n").map((x) => x.trim()).filter(Boolean) } : c) },
+  }));
+  const actualizarMinutos = (fase, valor) => {
+    const min = Number(valor);
+    if (!Number.isFinite(min) || min < 1 || min > 240) return;
+    setPlan((p) => {
+      const total = ["inicio", "desarrollo", "cierre"].reduce((n, k) => n + (k === fase ? min : Number(p[k].min) || 0), 0);
+      const rotaciones = fase === "desarrollo" && p.desarrollo.rotaciones?.length ? p.desarrollo.rotaciones.map((r, i, all) => ({ ...r, desde: Math.round(min * i / all.length), hasta: Math.round(min * (i + 1) / all.length) })) : p.desarrollo.rotaciones;
+      return { ...p, [fase]: { ...p[fase], min, ...(fase === "desarrollo" ? { rotaciones } : {}) }, meta: { ...p.meta, minutos: total, bloques: Math.ceil(total / 45) } };
+    });
+  };
 
   const copiarMaterial = async (texto) => {
     try {
@@ -369,6 +531,31 @@ Responde SOLO JSON, sin markdown:
     } catch (e) {
       setAviso("No se pudo copiar.");
     }
+  };
+
+  // Imprime solo un material: el contenido para el estudiante y, en página aparte, lo que es para el docente.
+  const imprimirMaterial = (m) => {
+    const w = window.open("", "_blank");
+    if (!w) return setAviso("Permite las ventanas emergentes para imprimir el material.");
+    const d = w.document;
+    d.title = m.titulo || m.tipo;
+    const st = d.createElement("style");
+    st.textContent = "body{font-family:system-ui,sans-serif;margin:24px} pre{white-space:pre-wrap;font:inherit;line-height:1.6} .docente{break-before:page}";
+    d.head.appendChild(st);
+    const seccion = (titulo, texto, cls) => {
+      if (!texto) return;
+      const s = d.createElement("section");
+      if (cls) s.className = cls;
+      const h = d.createElement("h2");
+      h.textContent = titulo;
+      const pre = d.createElement("pre");
+      pre.textContent = texto;
+      s.append(h, pre);
+      d.body.appendChild(s);
+    };
+    seccion(m.titulo || m.tipo, m.contenido);
+    seccion("Para el docente", materialTexto({ ...m, contenido: "" }, plan.meta.cursos), "docente");
+    w.print();
   };
 
   /* ---------- exportar ---------- */
@@ -393,9 +580,11 @@ Responde SOLO JSON, sin markdown:
   };
 
   const guardarPlan = async () => {
-    const item = { id: Date.now(), titulo: plan.titulo, fecha: ctx.fecha || new Date().toLocaleDateString("es-CL"), plan };
-    const next = [item, ...guardadas].slice(0, 12);
+    const id = planGuardadoId || Date.now();
+    const item = { id, titulo: plan.titulo, fecha: ctx.fecha || new Date().toLocaleDateString("es-CL"), plan };
+    const next = planGuardadoId ? guardadas.map((g) => g.id === planGuardadoId ? item : g) : [item, ...guardadas].slice(0, 12);
     setGuardadas(next);
+    setPlanGuardadoId(id);
     try {
       await window.storage.set("planificador:planes", JSON.stringify(next), false);
       setAviso("Planificación guardada.");
@@ -405,9 +594,59 @@ Responde SOLO JSON, sin markdown:
     }
   };
 
+  const textoUnidad = (u) => {
+    const lineas = [`# ${u.titulo}`, `${u.clases.length} clases · ${u.minutosPorClase} minutos cada una`, `\nPropósito: ${u.proposito}`, `Pregunta esencial: ${u.pregunta}`];
+    u.cursos.forEach((c) => {
+      lineas.push(`\n## ${c.gradoNombre} — ${c.asig}`);
+      c.oas.forEach((o) => lineas.push(`- ${o.cod} (${o.basal ? "basal" : "complementario"}): ${o.texto}`));
+    });
+    u.clases.forEach((c) => {
+      lineas.push(`\n## Clase ${c.numero}: ${c.objetivo}`, `OA: ${c.oas.map((o) => `${u.cursos[o.curso]?.gradoNombre || "curso"} ${o.codigo}`).join(", ")}`);
+      c.actividades.forEach((a) => lineas.push(`${u.cursos[a.curso]?.gradoNombre || "Curso"}: estudiantes — ${a.estudiantes}; docente — ${a.docente}`));
+      lineas.push(`Evidencia: ${c.evidencia}`, `Evaluación formativa: ${c.evaluacion}`);
+    });
+    lineas.push(`\n## Evaluación final\n${u.evaluacionFinal}`);
+    return lineas.join("\n");
+  };
+
+  const descargarUnidad = () => {
+    const url = URL.createObjectURL(new Blob([textoUnidad(unidad)], { type: "text/markdown;charset=utf-8" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `unidad-${unidad.titulo.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "aprendizaje"}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const guardarUnidad = async () => {
+    const id = unidadGuardadaId || Date.now();
+    const item = { id, titulo: unidad.titulo, fecha: new Date().toLocaleDateString("es-CL"), unidad };
+    const next = unidadGuardadaId ? unidadesGuardadas.map((u) => u.id === id ? item : u) : [item, ...unidadesGuardadas].slice(0, 12);
+    setUnidadesGuardadas(next);
+    setUnidadGuardadaId(id);
+    try {
+      await window.storage.set("planificador:unidades", JSON.stringify(next), false);
+      setAviso("Unidad guardada.");
+    } catch (e) {
+      setAviso("La unidad se guardó solo en esta sesión.");
+    }
+  };
+
+  const borrarUnidad = async (id) => {
+    const next = unidadesGuardadas.filter((u) => u.id !== id);
+    setUnidadesGuardadas(next);
+    if (unidadGuardadaId === id) setUnidadGuardadaId(null);
+    try {
+      await window.storage.set("planificador:unidades", JSON.stringify(next), false);
+    } catch (e) {
+      /* nada que hacer */
+    }
+  };
+
   const borrarGuardada = async (id) => {
     const next = guardadas.filter((g) => g.id !== id);
     setGuardadas(next);
+    if (planGuardadoId === id) setPlanGuardadoId(null);
     try {
       await window.storage.set("planificador:planes", JSON.stringify(next), false);
     } catch (e) {
@@ -419,144 +658,12 @@ Responde SOLO JSON, sin markdown:
      RENDER
      ============================================================ */
 
-  const CSS = `
-  @import url('https://fonts.googleapis.com/css2?family=Bitter:wght@500;700&family=Inter:wght@400;500;600&display=swap');
-  .pm { --tinta:#0F172A; --suave:#64748B; --papel:#F1F5F9; --linea:#E2E8F0;
-        --basal:#E11D48; --comp:#475569; --blanco:#FFFFFF; --acento:#4F46E5; --acentoHover:#4338CA;
-        font-family:'Inter',system-ui,-apple-system,sans-serif; color:var(--tinta);
-        background:var(--papel);
-        background-image:linear-gradient(rgba(79,70,229,.05) 1px, transparent 1px),
-                         linear-gradient(90deg, rgba(79,70,229,.05) 1px, transparent 1px);
-        background-size:26px 26px;
-        min-height:100vh; padding:24px 16px 64px;
-        animation:pmFadeIn .4s ease both; }
-  @keyframes pmFadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
-  @keyframes pmFadeUp { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
-  @keyframes pmSlideDown { from { opacity:0; transform:translateY(-6px); } to { opacity:1; transform:translateY(0); } }
-  .pm h1,.pm h2,.pm h3,.pm .slab { font-family:'Bitter',Georgia,serif; }
-  .wrap { max-width:1180px; margin:0 auto; }
-  .card { background:var(--blanco); border:1px solid var(--linea); border-radius:4px; animation:pmSlideDown .25s ease both; }
-  .hd { display:flex; flex-wrap:wrap; gap:16px; align-items:flex-end; justify-content:space-between;
-        border-bottom:3px solid var(--tinta); padding-bottom:14px; margin-bottom:20px; }
-  .hd h1 { font-size:29px; line-height:1.15; margin:0; font-weight:700; letter-spacing:-.01em; }
-  .hd p { margin:6px 0 0; font-size:14px; color:var(--suave); max-width:60ch; }
-  .btn { font:inherit; font-size:14px; font-weight:500; padding:9px 15px; border-radius:3px;
-         border:1px solid var(--tinta); background:var(--blanco); color:var(--tinta); cursor:pointer;
-         transition:background-color .15s ease, color .15s ease, border-color .15s ease, transform .12s ease, box-shadow .15s ease; }
-  .btn:hover { background:var(--tinta); color:var(--blanco); transform:translateY(-1px); }
-  .btn:active { transform:translateY(0); }
-  .btn:focus-visible, .pm *:focus-visible { outline:2px solid var(--acento); outline-offset:2px; }
-  .btn.solid { background:var(--acento); border-color:var(--acento); color:var(--blanco); }
-  .btn.solid:hover { background:var(--acentoHover); border-color:var(--acentoHover); box-shadow:0 4px 12px rgba(79,70,229,.3); }
-  .btn.solid:disabled { background:#9BAAB3; border-color:#9BAAB3; cursor:not-allowed; transform:none; box-shadow:none; }
-  .btn.sm { font-size:12.5px; padding:5px 10px; }
-  .rieles { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:18px; }
-  .riel { background:var(--blanco); border:1px solid var(--linea); border-top:5px solid var(--c);
-          border-radius:4px; display:flex; flex-direction:column;
-          animation:pmFadeUp .35s ease both; transition:box-shadow .18s ease; }
-  .riel:nth-child(1) { animation-delay:.02s; }
-  .riel:nth-child(2) { animation-delay:.08s; }
-  .riel:nth-child(3) { animation-delay:.14s; }
-  .riel:nth-child(4) { animation-delay:.2s; }
-  .rielHd { padding:14px 16px 12px; border-bottom:1px dashed var(--linea); }
-  .rielHd h2 { margin:0; font-size:17px; color:var(--c); }
-  .rielHd span { font-size:12.5px; color:var(--suave); }
-  .campo { width:100%; font:inherit; font-size:14px; padding:8px 10px; border:1px solid var(--linea);
-           border-radius:3px; background:var(--blanco); color:var(--tinta); }
-  .fila { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-  .chip { font-size:12.5px; padding:5px 11px; border-radius:999px; border:1px solid var(--linea);
-          background:var(--blanco); cursor:pointer; color:var(--suave); font-weight:500;
-          transition:background-color .15s ease, color .15s ease, border-color .15s ease; }
-  .chip.on { background:var(--c); border-color:var(--c); color:#fff; }
-  .lista { max-height:440px; overflow-y:auto; padding:10px 12px 4px; display:flex; flex-direction:column; gap:8px;
-           -webkit-mask-image:linear-gradient(to bottom, black calc(100% - 22px), transparent 100%);
-           mask-image:linear-gradient(to bottom, black calc(100% - 22px), transparent 100%);
-           scrollbar-width:thin; scrollbar-color:var(--linea) transparent; }
-  .lista::-webkit-scrollbar { width:8px; }
-  .lista::-webkit-scrollbar-thumb { background:var(--linea); border-radius:4px; }
-  .oa { border:1px solid var(--linea); background:var(--blanco); border-radius:3px; padding:9px 11px;
-        transition:border-color .15s ease, background-color .15s ease; }
-  .oa:hover { border-color:var(--c); }
-  .oa.on { border-color:var(--c); background:var(--cbg); }
-  .oaSelect { display:flex; gap:9px; align-items:flex-start; cursor:pointer; font:inherit; font-size:13.5px; line-height:1.45; }
-  .oaSelect input[type=checkbox] { flex:none; width:16px; height:16px; margin-top:3px; accent-color:var(--c); cursor:pointer; }
-  .oaTop { display:flex; gap:8px; align-items:center; margin-bottom:3px; flex-wrap:wrap; }
-  .cod { font-family:'Bitter',serif; font-weight:700; font-size:13px; color:var(--c); }
-  .tag { font-size:10.5px; font-weight:600; padding:2px 7px; border-radius:2px; letter-spacing:.02em; }
-  .tag.b { background:var(--basal); color:#fff; }
-  .tag.c { background:#EDF1F3; color:var(--comp); border:1px solid var(--linea); }
-  .eje { font-size:11px; color:var(--suave); }
-  .reclasificar { display:block; margin:6px 0 0 25px; border:none; background:none; padding:0; font:inherit;
-                  font-size:11.5px; color:var(--suave); text-decoration:underline; cursor:pointer; transition:color .15s ease; }
-  .reclasificar:hover { color:var(--c); }
-  .indBox { margin:9px 0 0 25px; padding:9px 11px; background:#F4F7F8; border-left:3px solid var(--c); border-radius:2px;
-            animation:pmSlideDown .2s ease both; }
-  .indList { margin:0; padding-left:16px; }
-  .indList li { font-size:12.5px; line-height:1.5; margin-bottom:8px; }
-  .indList li:last-child { margin-bottom:0; }
-  .indPick { display:flex; gap:8px; align-items:flex-start; cursor:pointer; }
-  .indPick input { flex:none; width:14px; height:14px; margin-top:2px; accent-color:var(--c); cursor:pointer; }
-  .hca { display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; }
-  .hcaT { font-size:10.5px; padding:2px 6px; border-radius:2px; background:#fff; border:1px solid var(--linea); color:var(--suave); }
-  .hcaT b { color:var(--tinta); font-weight:600; }
-  .barra { margin:20px 0; padding:16px 18px; background:var(--acento); border-radius:4px; color:#fff;
-           display:flex; gap:18px; flex-wrap:wrap; align-items:center; justify-content:space-between; }
-  .barra h3 { margin:0 0 4px; font-size:16px; color:#fff; }
-  .barra p { margin:0; font-size:13px; color:#E0E7FF; }
-  .bloqueBtn { font:inherit; font-size:13.5px; padding:8px 14px; border-radius:3px; cursor:pointer;
-               border:1px solid rgba(255,255,255,.4); background:transparent; color:#E0E7FF;
-               transition:background-color .15s ease, color .15s ease, border-color .15s ease; }
-  .bloqueBtn.on { background:#fff; color:var(--acento); border-color:#fff; font-weight:600; }
-  .plan { margin-top:26px; background:var(--blanco); border:1px solid var(--linea); border-radius:4px; overflow:hidden;
-          animation:pmFadeUp .4s ease both; }
-  .planHd { padding:22px 24px; border-bottom:3px solid var(--tinta); }
-  .planHd h2 { margin:0 0 6px; font-size:24px; line-height:1.2; }
-  .planHd .sub { font-size:13px; color:var(--suave); }
-  .momento { border-bottom:1px solid var(--linea); }
-  .momentoHd { display:flex; align-items:baseline; gap:12px; padding:14px 24px 8px; }
-  .momentoHd h3 { margin:0; font-size:17px; }
-  .min { font-size:12.5px; color:var(--suave); font-weight:500; }
-  .comun { margin:0 24px 14px; padding:12px 14px; background:#F4F7F8; border-left:3px solid var(--tinta); border-radius:2px; }
-  .comun .lbl { font-size:11.5px; font-weight:600; color:var(--suave); margin-bottom:6px; }
-  .ocBox { margin:14px 0 0; padding:12px 14px; background:#F4F7F8; border-left:3px solid var(--tinta); border-radius:2px; }
-  .ocBox .lbl { font-size:11.5px; font-weight:600; color:var(--suave); text-transform:uppercase; letter-spacing:.02em; margin-bottom:6px; }
-  .split { display:grid; grid-template-columns:repeat(var(--n,1),1fr); gap:0; border-top:1px dashed var(--linea); }
-  @media (max-width:820px){ .split { grid-template-columns:1fr; } }
-  .col { padding:14px 24px 18px; }
-  .col.borde { border-right:1px dashed var(--linea); }
-  .col h4 { margin:0 0 8px; font-size:14px; font-family:'Bitter',serif; }
-  .pm ul { margin:0; padding-left:18px; }
-  .pm li { font-size:14px; line-height:1.55; margin-bottom:6px; }
-  .grid3 { display:grid; grid-template-columns:repeat(3,1fr); gap:0; }
-  @media (max-width:820px){ .grid3 { grid-template-columns:1fr; } }
-  .box { padding:16px 24px; border-right:1px dashed var(--linea); }
-  .box:last-child { border-right:none; }
-  .aviso { margin:14px 0; padding:10px 14px; background:#FDF3E7; border:1px solid #E4C79B;
-           border-radius:3px; font-size:13.5px; animation:pmSlideDown .25s ease both; }
-  .nota { font-size:12px; color:var(--suave); line-height:1.5; }
-  .ctxGrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; padding:16px; }
-  .lbl2 { display:block; font-size:12px; font-weight:600; color:var(--suave); margin-bottom:4px; }
-  .material { border-bottom:1px dashed var(--linea); padding:10px 0; }
-  .material:last-child { border-bottom:none; }
-  .matContenido { margin-top:10px; padding:10px 12px; background:#F4F7F8; border:1px solid var(--linea); border-radius:3px; }
-  .matContenido pre { margin:0; font-family:inherit; font-size:12.5px; line-height:1.6; white-space:pre-wrap; }
-  .spin { display:inline-block; width:13px; height:13px; border:2px solid var(--linea);
-          border-top-color:var(--tinta); border-radius:50%; animation:sp .7s linear infinite; }
-  @keyframes sp { to { transform:rotate(360deg); } }
-  @media (prefers-reduced-motion:reduce){
-    .spin { animation:none; }
-    .pm, .card, .riel, .indBox, .aviso, .plan { animation:none; }
-    .btn:hover, .btn:active, .riel { transform:none; }
-  }
-  @media print {
-    .pm { background:#fff; padding:0; }
-    .noprint { display:none !important; }
-    .plan { border:none; margin:0; }
-    .momento, .split, .box { break-inside:avoid; }
-  }
-  `;
-
-  const Bullets = ({ items }) => <ul>{(items || []).map((x, i) => <li key={i}>{x}</li>)}</ul>;
+  // [].concat: si la API devuelve un string en vez de arreglo, se muestra como un solo punto en vez de romper el render.
+  const Bullets = ({ items }) => <ul>{[].concat(items || []).map((x, i) => <li key={i}>{typeof x === "object" ? JSON.stringify(x) : x}</li>)}</ul>;
+  const listaEditable = (items, onChange, etiqueta) => editandoPlan ? <label className="editorPlan"><span>{etiqueta} · una línea por punto</span><textarea className="campo" value={[].concat(items || []).join("\n")} onChange={(e) => onChange(e.target.value)} /></label> : <Bullets items={items} />;
+  const campoEditable = (value, onChange, etiqueta) => editandoPlan ? <label className="editorPlan"><span>{etiqueta}</span><input className="campo" value={value || ""} onChange={(e) => onChange(e.target.value)} /></label> : value;
+  const textoEditable = (value, onChange, etiqueta) => editandoPlan ? <label className="editorPlan"><span>{etiqueta}</span><textarea className="campo" rows={3} value={value || ""} onChange={(e) => onChange(e.target.value)} /></label> : value && <pre className="textoPlan">{value}</pre>;
+  const minutosFase = (fase) => editandoPlan ? <label className="minEditor"><span className="vh">Minutos de {fase}</span><input className="campo" type="number" min="1" max="240" step="1" value={plan[fase].min} onFocus={(e) => e.currentTarget.select()} onChange={(e) => actualizarMinutos(fase, e.target.value)} /> min</label> : <span className="min">{plan[fase].min} min</span>;
 
   const renderRiel = (idx) => {
     const r = rieles[idx];
@@ -595,8 +702,8 @@ Responde SOLO JSON, sin markdown:
               ))}
             </select>
           </div>
-          <span style={{ display: "block", marginTop: 10, fontSize: 12.5, color: "var(--suave)" }}>
-            <strong style={{ color: "var(--tinta)" }}>
+          <span className="rielCuenta">
+            <strong>
               {r.oaIds.length} seleccionado{r.oaIds.length === 1 ? "" : "s"}
             </strong>{" "}
             · {lista.filter((o) => o.basal).length} basales · {lista.filter((o) => !o.basal).length} complementarios
@@ -607,7 +714,7 @@ Responde SOLO JSON, sin markdown:
               ["comp", "Complementarios"],
               ["todos", "Todos"],
             ].map(([k, t]) => (
-              <button key={k} className={"chip" + (r.filtro === k ? " on" : "")} onClick={() => cambiarFiltro(idx, k)}>
+              <button key={k} className={"chip" + (r.filtro === k ? " on" : "")} aria-pressed={r.filtro === k} onClick={() => cambiarFiltro(idx, k)}>
                 {t}
               </button>
             ))}
@@ -625,10 +732,18 @@ Responde SOLO JSON, sin markdown:
         </div>
 
         <div className="lista">
-          {cargando && <p className="nota">Cargando objetivos de aprendizaje…</p>}
+          {cargando && (
+            <>
+              {[0, 1, 2, 3].map((k) => (
+                <div key={k} className="sk skOA" />
+              ))}
+              <span className="vh">Cargando objetivos de aprendizaje</span>
+            </>
+          )}
           {!cargando &&
             filtrados(idx).map((o) => {
               const on = r.oaIds.includes(o.id);
+              const fuente = fuenteOA(o, r);
               return (
                 <div key={o.id} className={"oa" + (on ? " on" : "")}>
                   <label className="oaSelect">
@@ -642,12 +757,22 @@ Responde SOLO JSON, sin markdown:
                       {o.texto}
                     </span>
                   </label>
+                  <div className="oaFuenteFila">
+                    <span className={`oaFuente ${fuente.tipo}`}>{fuente.etiqueta}</span>
+                    {fuente.url && <a href={fuente.url} target="_blank" rel="noreferrer">Ver página oficial del curso</a>}
+                  </div>
                   <button className="reclasificar" onClick={() => alternarBasal(o.id, o.basal)}>
                     {o.basal ? "Marcar como complementario" : "Marcar como basal"}
                   </button>
                   {on && (
                     <div className="indBox">
-                      {indCargando[o.id] && <span className="nota">Recopilando indicadores de evaluación…</span>}
+                      {indCargando[o.id] && (
+                        <>
+                          <div className="sk skLinea" />
+                          <div className="sk skLinea corta" />
+                          <span className="vh">Recopilando indicadores de evaluación</span>
+                        </>
+                      )}
                       {indCache[o.id] && (
                         <>
                           <p className="nota" style={{ margin: "0 0 8px" }}>
@@ -686,15 +811,16 @@ Responde SOLO JSON, sin markdown:
                 </div>
               );
             })}
-          {!cargando && filtrados(idx).length === 0 && <p className="nota">No hay objetivos con ese filtro en esta asignatura.</p>}
+          {!cargando && filtrados(idx).length === 0 && <p className="vacio">No hay objetivos con ese filtro en esta asignatura.</p>}
         </div>
 
-        <div style={{ padding: "0 12px 12px" }}>
+        <div className="rielPie">
           {nuevoOA.abierto === idx ? (
-            <div style={{ border: "1px dashed var(--linea)", padding: 10, borderRadius: 3 }}>
+            <div className="nuevoOA">
               <textarea
                 className="campo"
                 rows={3}
+                aria-label="Objetivo propio"
                 placeholder="Escribe el objetivo tal como aparece en tu programa"
                 value={nuevoOA.texto}
                 onChange={(e) => setNuevoOA((n) => ({ ...n, texto: e.target.value }))}
@@ -725,7 +851,6 @@ Responde SOLO JSON, sin markdown:
 
   return (
     <div className="pm">
-      <style>{CSS}</style>
       <div className="wrap">
         <header className="hd">
           <div>
@@ -793,78 +918,197 @@ Responde SOLO JSON, sin markdown:
                   onChange={(e) => setCtx((c) => ({ ...c, nee: e.target.value }))}
                 />
               </div>
+              <div>
+                <label className="lbl2" htmlFor="f-foco">Foco de la clase</label>
+                <select id="f-foco" className="campo" value={ctx.foco} onChange={(e) => setCtx((c) => ({ ...c, foco: e.target.value }))}>
+                  <option value="">Equilibrado</option>
+                  <option value="introducir un aprendizaje nuevo">Introducir contenido nuevo</option>
+                  <option value="practicar y aplicar lo aprendido">Practicar y aplicar</option>
+                  <option value="repasar y consolidar aprendizajes">Repasar y consolidar</option>
+                  <option value="recoger evidencia y evaluar formativamente">Evaluar formativamente</option>
+                </select>
+              </div>
+              <div>
+                <label className="lbl2" htmlFor="f-previos">Conocimientos previos del grupo</label>
+                <input id="f-previos" className="campo" placeholder="Qué ya saben o qué conviene activar" value={ctx.previos} onChange={(e) => setCtx((c) => ({ ...c, previos: e.target.value }))} />
+              </div>
             </div>
           </div>
         )}
 
-        {aviso && <div className="aviso noprint">{aviso}</div>}
-
-        <div className="barra noprint" style={{ marginBottom: 18 }}>
-          <div>
-            <h3>Tipo de clase</h3>
-            <p>Un curso único, o varios cursos combinados en aula multigrado.</p>
+        {aviso && (
+          <div
+            role="status"
+            aria-live="polite"
+            className={"aviso noprint" + (/copiad|guardad/i.test(aviso) && !/^No /.test(aviso) ? " ok" : /^No se pudo/.test(aviso) ? " error" : "")}
+          >
+            {aviso}
           </div>
-          <div className="fila">
+        )}
+
+        <section className="paso noprint" aria-labelledby="paso-1">
+          <div className="pasoHd">
+            <span className="pasoNum" aria-hidden="true">
+              1
+            </span>
+            <div>
+              <h2 id="paso-1">Tipo de clase</h2>
+              <p>Un curso único, o varios cursos combinados en aula multigrado.</p>
+            </div>
+          </div>
+          <div className="seg">
             {[1, 2, 3, 4].map((n) => (
-              <button key={n} className={"bloqueBtn" + (rieles.length === n ? " on" : "")} onClick={() => cambiarNumCursos(n)}>
+              <button key={n} className={"bloqueBtn" + (rieles.length === n ? " on" : "")} aria-pressed={rieles.length === n} onClick={() => cambiarNumCursos(n)}>
                 {n === 1 ? "Curso único" : `${n} cursos · multigrado`}
               </button>
             ))}
           </div>
-        </div>
+        </section>
 
-        <div className="rieles noprint">{rieles.map((_, i) => renderRiel(i))}</div>
+        <section className="paso noprint" aria-labelledby="paso-2">
+          <div className="pasoHd">
+            <span className="pasoNum" aria-hidden="true">
+              2
+            </span>
+            <div>
+              <h2 id="paso-2">Cursos y objetivos</h2>
+              <p>Elige curso, asignatura y los OA que trabajarás en cada uno.</p>
+            </div>
+          </div>
+          <div className="rieles">{rieles.map((_, i) => renderRiel(i))}</div>
+        </section>
 
-        <div className="barra noprint">
-          <div>
-            <h3>Duración de la clase</h3>
-            <p>Cada bloque dura 45 minutos.</p>
+        <section className="paso noprint" aria-labelledby="paso-3">
+          <div className="pasoHd">
+            <span className="pasoNum" aria-hidden="true">
+              3
+            </span>
+            <div>
+              <h2 id="paso-3">Duración</h2>
+              <p>Cada bloque dura 45 minutos.</p>
+            </div>
           </div>
-          <div className="fila">
-            <button className={"bloqueBtn" + (bloques === 1 ? " on" : "")} onClick={() => setBloques(1)}>
-              1 bloque · 45 min
-            </button>
-            <button className={"bloqueBtn" + (bloques === 2 ? " on" : "")} onClick={() => setBloques(2)}>
-              2 bloques · 90 min
-            </button>
+          <div className="seg">
+            {[1, 2].map((b) => (
+              <button key={b} className={"bloqueBtn" + (bloques === b ? " on" : "")} aria-pressed={bloques === b} onClick={() => setBloques(b)}>
+                {b === 1 ? "1 bloque · 45 min" : "2 bloques · 90 min"}
+              </button>
+            ))}
           </div>
-          <div style={{ textAlign: "right" }}>
-            <button className="btn solid" onClick={generar} disabled={!listo || generando} style={{ background: "#fff", color: "var(--acento)", borderColor: "#fff" }}>
-              {generando && <span className="spin" style={{ marginRight: 8, verticalAlign: -2 }} />}
-              {generando ? "Armando la clase…" : "Crear la clase"}
-            </button>
+          <div className="unidadConfig">
+            <label className="lbl2" htmlFor="unidad-sesiones">Clases de la unidad (2 a 12)</label>
+            <input id="unidad-sesiones" className="campo" type="number" min="2" max="12" step="1" value={sesionesUnidad} onChange={(e) => { const n = Number(e.target.value); if (Number.isInteger(n) && n >= 2 && n <= 12) setSesionesUnidad(n); }} />
+          </div>
+        </section>
+
+        <div className="accion noprint" role="region" aria-label="Crear una clase o planificar una unidad">
+          <div className="accionResumen">
+            <strong>{multigrado ? `${rieles.length} cursos · multigrado` : "Curso único"}</strong>
+            <span>
+              {rieles.map((r) => `${nombreGrado(r.grado)}: ${r.oaIds.length} OA`).join(" · ")} · {TIEMPOS[bloques].total} min/clase · unidad de ${sesionesUnidad} clases
+            </span>
             {!listo && (
-              <p style={{ margin: "6px 0 0", fontSize: 12, color: "#E0E7FF", maxWidth: 240 }}>Falta elegir objetivo en: {faltantes.join(", ")}</p>
+              <span className="accionFalta" id="falta">
+                Falta elegir objetivo en: {faltantes.join(", ")}
+              </span>
             )}
           </div>
+          <button className="btn solid lg" onClick={() => generar()} disabled={!listo || generando || generandoUnidad} aria-describedby={!listo ? "falta" : undefined}>
+            {generando && <span className="spin" aria-hidden="true" />}
+            {generando ? "Armando la clase…" : "Crear la clase"}
+          </button>
+          <button className="btn lg" onClick={generarUnidad} disabled={!listo || generando || generandoUnidad}>
+            {generandoUnidad && <span className="spin" aria-hidden="true" />}
+            {generandoUnidad ? "Planificando unidad…" : "Planificar unidad"}
+          </button>
         </div>
 
-        {plan && (
-          <article className="plan" id="plan-clase">
+        {generando && !plan && (
+          <div className="plan esqueleto noprint" aria-busy="true" aria-label="Armando la clase">
             <div className="planHd">
+              <div className="sk skTitulo" />
+              <div className="sk skLinea" />
+              <div className="sk skLinea corta" />
+            </div>
+            <div className="sk skBarra" />
+            {[0, 1, 2].map((k) => (
+              <div key={k} className="sk skBloque" />
+            ))}
+          </div>
+        )}
+
+        {generandoUnidad && <p className="aviso" role="status" aria-live="polite">Distribuyendo los objetivos entre {sesionesUnidad} clases y revisando su cobertura…</p>}
+
+        {plan && vistaResultado === "clase" && (
+          <article className="plan" id="plan-clase" aria-busy={generando}>
+            <div className="planHd">
+              <p className="planKicker">Planificación de clase</p>
               <h2>{plan.titulo}</h2>
-              <div className="sub">
-                {plan.meta.multigrado ? "Aula multigrado" : "Clase"} · {plan.meta.cursos.map((c) => c.gradoNombre).join(" y ")} · {plan.meta.bloques} bloque
-                {plan.meta.bloques > 1 ? "s" : ""} · {plan.meta.minutos} minutos
-                {plan.meta.escuela ? " · " + plan.meta.escuela : ""}
-                {plan.meta.docente ? " · " + plan.meta.docente : ""}
-                {plan.meta.fecha ? " · " + plan.meta.fecha : ""}
-              </div>
-              <p style={{ marginTop: 10, fontSize: 14.5, lineHeight: 1.55 }}>{plan.hilo}</p>
+              <dl className="ficha">
+                <div>
+                  <dt>{plan.meta.cursos.length > 1 ? "Cursos" : "Curso"}</dt>
+                  <dd>
+                    {plan.meta.cursos.map((c) => c.gradoNombre).join(" y ")}
+                    {plan.meta.multigrado ? " · multigrado" : ""}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Asignatura</dt>
+                  <dd>{[...new Set(plan.meta.cursos.map((c) => c.asig))].join(", ")}</dd>
+                </div>
+                <div>
+                  <dt>Duración</dt>
+                  <dd>
+                    {plan.meta.bloques} bloque{plan.meta.bloques > 1 ? "s" : ""} · {plan.meta.minutos} min
+                  </dd>
+                </div>
+                {plan.meta.fecha && (
+                  <div>
+                    <dt>Fecha</dt>
+                    <dd>{plan.meta.fecha}</dd>
+                  </div>
+                )}
+                {plan.meta.docente && (
+                  <div>
+                    <dt>Docente</dt>
+                    <dd>{plan.meta.docente}</dd>
+                  </div>
+                )}
+                {plan.meta.escuela && (
+                  <div>
+                    <dt>Escuela</dt>
+                    <dd>{plan.meta.escuela}</dd>
+                  </div>
+                )}
+              </dl>
+              <p className="hilo">{plan.hilo}</p>
               {plan.objetivosClase?.length > 0 && (
                 <div className="ocBox">
                   <div className="lbl">Objetivo{plan.objetivosClase.length > 1 ? "s" : ""} de la clase</div>
                   {plan.objetivosClase.map((o, i) => (
-                    <p key={i} style={{ margin: "0 0 6px", fontSize: 15, lineHeight: 1.5 }}>
+                    <p key={i} className="ocItem">
                       {plan.meta.cursos.length > 1 && <strong style={{ color: colorDe(i) }}>{plan.meta.cursos[i]?.gradoNombre}: </strong>}
                       {o}
                     </p>
                   ))}
                 </div>
               )}
-              <div className="split" style={{ "--n": plan.meta.cursos.length, marginTop: 14 }}>
+              <section className="alineacion" aria-labelledby="alineacion-titulo">
+                <h3 id="alineacion-titulo">Revisión de alineación</h3>
+                <p className="nota">Vínculos sugeridos por IA entre cada OA, una actividad y la evidencia a observar. Revísalos antes de usar la planificación.</p>
                 {plan.meta.cursos.map((c, i) => (
-                  <div key={i} className={"col" + (i < plan.meta.cursos.length - 1 ? " borde" : "")} style={{ paddingLeft: i === 0 ? 0 : 24 }}>
+                  <div className="alineacionCurso" key={i}>
+                    <h4 style={{ color: colorDe(i) }}>{c.gradoNombre} · {c.asig}</h4>
+                    {c.oas.map((o, j) => {
+                      const vinculo = plan.alineacion?.find((x) => x.curso === i && x.oa === o.cod);
+                      return <div className="alineacionFila" key={j}><strong>{o.cod}</strong><span>{vinculo ? <><b>Actividad:</b> {vinculo.actividad}<br /><b>Evidencia:</b> {vinculo.evidencia}</> : <span className="alertaAlineacion">No se generó un vínculo para este objetivo; revísalo manualmente.</span>}</span></div>;
+                    })}
+                  </div>
+                ))}
+              </section>
+              <div className="split" style={{ "--n": plan.meta.cursos.length }}>
+                {plan.meta.cursos.map((c, i) => (
+                  <div key={i} className={"col" + (i < plan.meta.cursos.length - 1 ? " borde" : "")}>
                     <h4 style={{ color: colorDe(i) }}>
                       {c.gradoNombre} · {c.asig}
                     </h4>
@@ -874,6 +1118,9 @@ Responde SOLO JSON, sin markdown:
                           <strong>{o.cod}</strong> <span className={"tag " + (o.basal ? "b" : "c")}>{o.basal ? "Basal" : "Complementario"}</span>
                           <br />
                           {o.texto}
+                          <br />
+                          <span className={`oaFuente ${o.fuenteTipo || "ia"}`}>{o.fuente || "Origen del objetivo no registrado en esta planificación"}</span>
+                          {o.url && <> · <a href={o.url} target="_blank" rel="noreferrer">Página curricular oficial</a></>}
                         </p>
                         {o.indicadores?.length > 0 && (
                           <ul style={{ margin: "4px 0 0", paddingLeft: 16 }}>
@@ -891,73 +1138,109 @@ Responde SOLO JSON, sin markdown:
               </div>
             </div>
 
-            <div className="momento">
-              <div className="momentoHd">
-                <h3>Inicio</h3>
-                <span className="min">{plan.inicio.min} minutos</span>
-              </div>
-              <div className="comun">
-                <div className="lbl">Estudiantes</div>
-                <Bullets items={plan.inicio.estudiantes} />
-                <div className="lbl" style={{ marginTop: 10 }}>
-                  Orientación al docente
+            {(() => {
+              const a = +plan.inicio.min || 0,
+                b = +plan.desarrollo.min || 0,
+                c = +plan.cierre.min || 0;
+              return (
+                <div className="lineaTiempo" role="img" aria-label={`Inicio ${a} min, desarrollo ${b} min, cierre ${c} min`}>
+                  <span className="lt i" style={{ flexGrow: a }}>
+                    Inicio · 0–{a}
+                  </span>
+                  <span className="lt d" style={{ flexGrow: b }}>
+                    Desarrollo · {a}–{a + b}
+                  </span>
+                  <span className="lt c" style={{ flexGrow: c }}>
+                    Cierre · {a + b}–{a + b + c}
+                  </span>
                 </div>
-                <Bullets items={plan.inicio.docente} />
-                {plan.inicio.pregunta && (
-                  <p style={{ margin: "8px 0 0", fontSize: 14 }}>
-                    <strong>Pregunta que abre la clase:</strong> {plan.inicio.pregunta}
-                  </p>
-                )}
-              </div>
-            </div>
+              );
+            })()}
 
-            <div className="momento">
-              <div className="momentoHd">
-                <h3>Desarrollo</h3>
-                <span className="min">{plan.desarrollo.min} minutos</span>
-              </div>
-              {((plan.desarrollo.comunEstudiantes || []).length > 0 || (plan.desarrollo.comunDocente || []).length > 0) && (
-                <div className="comun">
-                  <div className="lbl">Estudiantes, con todos los cursos</div>
-                  <Bullets items={plan.desarrollo.comunEstudiantes} />
-                  <div className="lbl" style={{ marginTop: 10 }}>
-                    Orientación al docente
-                  </div>
-                  <Bullets items={plan.desarrollo.comunDocente} />
+            <div className="momentos">
+              <section className="momento t">
+                <div className="momentoHd">
+                  <h3>Inicio</h3>
+                  {minutosFase("inicio")}
                 </div>
-              )}
-              <div className="split" style={{ "--n": plan.meta.cursos.length }}>
-                {plan.meta.cursos.map((c, i) => (
-                  <div key={i} className={"col" + (i < plan.meta.cursos.length - 1 ? " borde" : "")}>
-                    {plan.meta.cursos.length > 1 && <h4 style={{ color: colorDe(i) }}>{c.gradoNombre} trabaja en</h4>}
+                <div className="comun duo">
+                  <div className="rol est">
                     <div className="lbl">Estudiantes</div>
-                    <Bullets items={plan.desarrollo.porCurso?.[i]?.estudiantes} />
-                    <div className="lbl" style={{ marginTop: 10 }}>
-                      Orientación al docente
-                    </div>
-                    <Bullets items={plan.desarrollo.porCurso?.[i]?.docente} />
+                    {listaEditable(plan.inicio.estudiantes, (v) => actualizarListaFase("inicio", "estudiantes", v), "Acciones de estudiantes")}
                   </div>
-                ))}
-              </div>
-            </div>
+                  <div className="rol doc">
+                    <div className="lbl">Orientación al docente</div>
+                    {listaEditable(plan.inicio.docente, (v) => actualizarListaFase("inicio", "docente", v), "Orientaciones al docente")}
+                  </div>
+                  {(plan.inicio.pregunta || editandoPlan) && (
+                    <p className="pregunta">
+                      <strong>Pregunta que abre la clase:</strong> {editandoPlan ? <input className="campo" value={plan.inicio.pregunta} onChange={(e) => actualizarFase("inicio", "pregunta", e.target.value)} /> : plan.inicio.pregunta}
+                    </p>
+                  )}
+                </div>
+              </section>
 
-            <div className="momento">
-              <div className="momentoHd">
-                <h3>Cierre</h3>
-                <span className="min">{plan.cierre.min} minutos</span>
-              </div>
-              <div className="comun">
-                <div className="lbl">Estudiantes</div>
-                <Bullets items={plan.cierre.estudiantes} />
-                <div className="lbl" style={{ marginTop: 10 }}>
-                  Orientación al docente
+              <section className="momento t">
+                <div className="momentoHd">
+                  <h3>Desarrollo</h3>
+                  {minutosFase("desarrollo")}
                 </div>
-                <Bullets items={plan.cierre.docente} />
-                <div className="lbl" style={{ marginTop: 10 }}>
-                  Preguntas para los estudiantes
+                {(editandoPlan || (plan.desarrollo.comunEstudiantes || []).length > 0 || (plan.desarrollo.comunDocente || []).length > 0) && (
+                  <div className="comun duo">
+                    <div className="rol est">
+                      <div className="lbl">Estudiantes, con todos los cursos</div>
+                      {listaEditable(plan.desarrollo.comunEstudiantes, (v) => actualizarListaFase("desarrollo", "comunEstudiantes", v), "Acciones comunes")}
+                    </div>
+                    <div className="rol doc">
+                      <div className="lbl">Orientación al docente</div>
+                      {listaEditable(plan.desarrollo.comunDocente, (v) => actualizarListaFase("desarrollo", "comunDocente", v), "Orientaciones comunes")}
+                    </div>
+                  </div>
+                )}
+                {plan.meta.multigrado && plan.desarrollo.rotaciones?.length > 0 && (
+                  <div className="rotaciones">
+                    <h4>Rotación de la atención docente</h4>
+                    <p className="nota">Secuencia sugerida para el trabajo simultáneo; ajústala al ritmo del grupo y a los {plan.desarrollo.min} minutos disponibles.</p>
+                    <ol>{plan.desarrollo.rotaciones.map((r, i) => <li key={i}><strong>Min. {r.desde}–{r.hasta} · {r.curso}</strong><span><b>Docente:</b> {r.docente}<br /><b>Mientras tanto:</b> {r.otros}</span></li>)}</ol>
+                  </div>
+                )}
+                <div className="split" style={{ "--n": plan.meta.cursos.length }}>
+                  {plan.meta.cursos.map((c, i, todos) => (
+                    <div key={i} className={"col" + (i < todos.length - 1 ? " borde" : "") + (todos.length === 1 ? " duo" : "")}>
+                      {todos.length > 1 && <h4 style={{ color: colorDe(i) }}>{c.gradoNombre} trabaja en</h4>}
+                      <div className="rol est">
+                        <div className="lbl">Estudiantes</div>
+                        {listaEditable(plan.desarrollo.porCurso?.[i]?.estudiantes, (v) => actualizarListaCurso("desarrollo", i, "estudiantes", v), `Acciones para ${c.gradoNombre}`)}
+                      </div>
+                      <div className="rol doc">
+                        <div className="lbl">Orientación al docente</div>
+                        {listaEditable(plan.desarrollo.porCurso?.[i]?.docente, (v) => actualizarListaCurso("desarrollo", i, "docente", v), `Orientaciones para ${c.gradoNombre}`)}
+                      </div>
+                    </div>
+                  ))}
                 </div>
-                <Bullets items={plan.cierre.metacognicion} />
-              </div>
+              </section>
+
+              <section className="momento t">
+                <div className="momentoHd">
+                  <h3>Cierre</h3>
+                  {minutosFase("cierre")}
+                </div>
+                <div className="comun duo">
+                  <div className="rol est">
+                    <div className="lbl">Estudiantes</div>
+                    {listaEditable(plan.cierre.estudiantes, (v) => actualizarListaFase("cierre", "estudiantes", v), "Acciones de cierre")}
+                  </div>
+                  <div className="rol doc">
+                    <div className="lbl">Orientación al docente</div>
+                    {listaEditable(plan.cierre.docente, (v) => actualizarListaFase("cierre", "docente", v), "Orientaciones de cierre")}
+                  </div>
+                  <div className="rol est full">
+                    <div className="lbl">Preguntas para los estudiantes</div>
+                    {listaEditable(plan.cierre.metacognicion, (v) => actualizarListaFase("cierre", "metacognicion", v), "Preguntas de metacognición")}
+                  </div>
+                </div>
+              </section>
             </div>
 
             <div className="momento">
@@ -967,15 +1250,15 @@ Responde SOLO JSON, sin markdown:
               </div>
               <div className="grid3">
                 <div className="box">
-                  <h4 style={{ margin: "0 0 8px", fontFamily: "'Bitter',serif", fontSize: 14 }}>Cómo se presenta</h4>
+                  <h4>Cómo se presenta</h4>
                   <Bullets items={plan.dua.representacion} />
                 </div>
                 <div className="box">
-                  <h4 style={{ margin: "0 0 8px", fontFamily: "'Bitter',serif", fontSize: 14 }}>Cómo responden</h4>
+                  <h4>Cómo responden</h4>
                   <Bullets items={plan.dua.accion} />
                 </div>
                 <div className="box">
-                  <h4 style={{ margin: "0 0 8px", fontFamily: "'Bitter',serif", fontSize: 14 }}>Cómo se involucran</h4>
+                  <h4>Cómo se involucran</h4>
                   <Bullets items={plan.dua.motivacion} />
                 </div>
               </div>
@@ -990,7 +1273,7 @@ Responde SOLO JSON, sin markdown:
                 {plan.meta.cursos.map((c, i) => (
                   <div key={i} className={"col" + (i < plan.meta.cursos.length - 1 ? " borde" : "")}>
                     <h4 style={{ color: colorDe(i) }}>Qué observo en {c.gradoNombre}</h4>
-                    <Bullets items={plan.evaluacion.porCurso?.[i]?.criterios} />
+                    {listaEditable(plan.evaluacion.porCurso?.[i]?.criterios, (v) => actualizarCriterios(i, v), `Criterios para ${c.gradoNombre}`)}
                   </div>
                 ))}
               </div>
@@ -1001,70 +1284,124 @@ Responde SOLO JSON, sin markdown:
                 <div className="grid3">
                   {plan.tutoria && (
                     <div className="box">
-                      <h4 style={{ margin: "0 0 8px", fontFamily: "'Bitter',serif", fontSize: 14 }}>Tutoría entre pares</h4>
+                      <h4>Tutoría entre pares</h4>
                       <p style={{ fontSize: 14, lineHeight: 1.55, margin: 0 }}>{plan.tutoria}</p>
                     </div>
                   )}
                   <div className="box">
-                    <h4 style={{ margin: "0 0 8px", fontFamily: "'Bitter',serif", fontSize: 14 }}>Adecuaciones</h4>
+                    <h4>Adecuaciones</h4>
                     <Bullets items={plan.adecuaciones} />
                   </div>
                 </div>
               </div>
             )}
 
-            <div className="momento">
+            <section className="momento materiales">
               <div className="momentoHd">
                 <h3>Materiales</h3>
-                <span className="min">El contenido listo para usar se genera solo; agrega el link solo si es un recurso externo</span>
+                <span className="min">Listos para imprimir. Revisa el solucionario y los links sugeridos antes de usarlos</span>
               </div>
-              <div style={{ padding: "0 24px 16px" }}>
+              <div className="matGrid">
                 {(plan.materiales || []).map((m, i) => (
-                  <div key={i} className="material">
-                    <div className="fila" style={{ justifyContent: "space-between", alignItems: "flex-start" }}>
-                      <div style={{ flex: "1 1 240px" }}>
-                        <strong style={{ fontSize: 13.5 }}>{m.tipo}</strong>
-                        <p style={{ margin: "2px 0 0", fontSize: 13.5, color: "var(--suave)" }}>{m.descripcion}</p>
+                  <article key={m.id || i} className="matCard">
+                    <header className="matHd">
+                      <div>
+                        <h4>{campoEditable(m.titulo || m.tipo, (v) => actualizarMaterial(i, "titulo", v), "Título del material")}</h4>
+                        <p>{campoEditable(m.proposito || m.descripcion, (v) => actualizarMaterial(i, "proposito", v), "Propósito")}</p>
+                        {m.momento && (
+                          <p className="nota">
+                            {m.momento}
+                            {plan.meta.cursos.length > 1 && ` · ${m.curso === "todos" ? "todos los cursos" : plan.meta.cursos[m.curso]?.gradoNombre}`}
+                            {m.cantidad?.total && ` · Cantidad: ${m.cantidad.total}`}
+                          </p>
+                        )}
                       </div>
-                      {!m.contenido && (
-                        <div className="noprint" style={{ flex: "1 1 220px" }}>
-                          <label className="lbl2" htmlFor={`mat-link-${i}`}>
-                            Link (opcional)
-                          </label>
-                          <input
-                            id={`mat-link-${i}`}
-                            className="campo"
-                            placeholder="Pega aquí el link del material"
-                            value={m.link || ""}
-                            onChange={(e) => actualizarLinkMaterial(i, e.target.value)}
-                          />
-                        </div>
-                      )}
-                      {m.link && (
-                        <a className="nota" href={m.link} target="_blank" rel="noreferrer">
-                          {m.link}
-                        </a>
-                      )}
-                    </div>
-                    {m.contenido && (
-                      <div className="matContenido">
-                        <div className="fila noprint" style={{ justifyContent: "space-between", marginBottom: 6 }}>
-                          <span className="lbl2" style={{ margin: 0 }}>
-                            Contenido listo para usar
-                          </span>
-                          <button className="btn sm" onClick={() => copiarMaterial(m.contenido)}>
-                            Copiar
-                          </button>
-                        </div>
-                        <pre>{m.contenido}</pre>
+                      <div className="matAcciones noprint">
+                        <button className="btn sm" aria-label={`Copiar ${m.titulo || m.tipo}`} onClick={() => copiarMaterial(materialTexto(m, plan.meta.cursos))}>
+                          Copiar
+                        </button>
+                        <button className="btn sm" aria-label={`Imprimir ${m.titulo || m.tipo}`} onClick={() => imprimirMaterial(m)}>
+                          Imprimir
+                        </button>
+                      </div>
+                    </header>
+                    {(m.preparacion?.length > 0 || editandoPlan) && (
+                      <div className="matSec">
+                        <div className="lbl2">Preparación previa</div>
+                        {listaEditable(m.preparacion, (v) => actualizarMaterial(i, "preparacion", v.split("\n").map((x) => x.trim()).filter(Boolean)), "Preparación previa")}
                       </div>
                     )}
-                  </div>
+                    {(m.instrucciones_uso?.length > 0 || editandoPlan) && (
+                      <div className="matSec">
+                        <div className="lbl2">Cómo se usa en la sala</div>
+                        {listaEditable(m.instrucciones_uso, (v) => actualizarMaterial(i, "instrucciones_uso", v.split("\n").map((x) => x.trim()).filter(Boolean)), "Instrucciones de uso")}
+                      </div>
+                    )}
+                    {(m.contenido || editandoPlan) && (
+                      <div className="matSec matContenido">
+                        <div className="lbl2">Contenido listo para imprimir</div>
+                        {textoEditable(m.contenido, (v) => actualizarMaterial(i, "contenido", v), "Contenido del material")}
+                      </div>
+                    )}
+                    {[
+                      ["solucionario", "Para el docente: solucionario (revisar antes de imprimir)"],
+                      ["adecuacion", "Adecuación NEE"],
+                      ["alternativa_sin_tecnologia", "Alternativa sin tecnología"],
+                    ].map(
+                      ([k, t]) =>
+                        (m[k] || editandoPlan) && (
+                          <details key={k} className={"matSec " + k} open={editandoPlan ? true : undefined}>
+                            <summary>{t}</summary>
+                            {textoEditable(m[k], (v) => actualizarMaterial(i, k, v), t)}
+                          </details>
+                        )
+                    )}
+                    {m.referencias?.length > 0 && (
+                      <div className="matSec matRefs">
+                        <div className="lbl2">Referencias</div>
+                        <ul>
+                          {m.referencias.map((r, k) => (
+                            <li key={k}>
+                              <span className={r.tipo_link === "ia" ? "refIA" : r.tipo_link === "curado" ? "refOficial" : "refBusq"}>{ETIQUETA_LINK[r.tipo_link]}</span>
+                              <a href={r.url} target="_blank" rel="noreferrer">
+                                {r.titulo}
+                              </a>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    <div className="matSec link noprint">
+                      <label className="lbl2" htmlFor={`mat-link-${i}`}>
+                        Agregar mi propio link (opcional)
+                      </label>
+                      <input
+                        id={`mat-link-${i}`}
+                        className="campo"
+                        placeholder="https://..."
+                        value={m.link || ""}
+                        onChange={(e) => actualizarLinkMaterial(i, e.target.value)}
+                      />
+                    </div>
+                    {esHttps(m.link) && (
+                      <a className="matLink" href={m.link} target="_blank" rel="noreferrer">
+                        {m.link}
+                      </a>
+                    )}
+                  </article>
                 ))}
               </div>
-            </div>
+            </section>
 
-            <div className="fila noprint" style={{ padding: "16px 24px" }}>
+            <div className="planAcciones noprint">
+              <button className={"btn" + (editandoPlan ? " solid" : "")} onClick={() => setEditandoPlan((v) => !v)} disabled={generando}>
+                {editandoPlan ? "Terminar edición" : "Editar planificación"}
+              </button>
+              {editandoPlan && <span className="nota" role="status">Tus cambios se incluyen al imprimir, copiar, descargar o guardar.</span>}
+              <div className="ajustesPlan" aria-label="Ajustar la planificación">
+                <span className="lbl2">Ajustar y volver a generar</span>
+                {[["Simplificar y reducir materiales", "Simplifica las instrucciones y reduce la cantidad de materiales."], ["Agregar movimiento", "Añade una actividad breve de movimiento vinculada a los objetivos."], ["Subir el desafío", "Haz más desafiante la práctica para estudiantes que avanzan rápido."]].map(([etiqueta, ajuste]) => <button key={etiqueta} className="btn sm" disabled={generando || editandoPlan} onClick={() => generar(ajuste)}>{etiqueta}</button>)}
+              </div>
               <button className="btn solid" onClick={() => window.print()}>
                 Imprimir
               </button>
@@ -1075,26 +1412,76 @@ Responde SOLO JSON, sin markdown:
                 Descargar
               </button>
               <button className="btn" onClick={guardarPlan}>
-                Guardar
+                {planGuardadoId ? "Guardar cambios" : "Guardar"}
               </button>
-              <button className="btn" onClick={generar} disabled={generando}>
-                {generando && <span className="spin" style={{ marginRight: 8, verticalAlign: -2 }} />}
+              <button className="btn" onClick={() => generar()} disabled={generando || editandoPlan}>
+                {generando && <span className="spin" aria-hidden="true" />}
                 {generando ? "Armando…" : "Crear otra versión"}
               </button>
             </div>
           </article>
         )}
 
+        {unidad && vistaResultado === "unidad" && (
+          <article className="plan unidad" id="plan-unidad">
+            <header className="planHd">
+              <p className="planKicker">Planificación de unidad · {unidad.clases.length} clases</p>
+              <h2>{unidad.titulo}</h2>
+              <p className="hilo">{unidad.proposito}</p>
+              <div className="ocBox"><div className="lbl">Pregunta esencial</div><p className="ocItem">{unidad.pregunta}</p></div>
+              <section className="coberturaUnidad" aria-labelledby="cobertura-unidad">
+                <h3 id="cobertura-unidad">Cobertura de objetivos</h3>
+                <p className="nota">La cobertura se calcula con los OA que la IA asignó a cada clase. Los objetivos sin asignación quedan señalados.</p>
+                {unidad.cursos.map((c, i) => <div className="coberturaCurso" key={i}>
+                  <h4 style={{ color: colorDe(i) }}>{c.gradoNombre} · {c.asig}</h4>
+                  {c.oas.map((o, j) => {
+                    const en = unidad.clases.filter((cl) => cl.oas.some((x) => x.curso === i && x.codigo === o.cod)).map((cl) => cl.numero);
+                    return <div className="coberturaOA" key={j}><span><strong>{o.cod}</strong> <span className={"tag " + (o.basal ? "b" : "c")}>{o.basal ? "Basal" : "Complementario"}</span></span><span className={en.length ? "cubierto" : "sinCobertura"}>{en.length ? `Clases ${en.join(", ")}` : "Sin clase asignada · revisar"}</span></div>;
+                  })}
+                </div>)}
+              </section>
+            </header>
+            <div className="momentos">
+              {unidad.clases.map((clase) => <section className="momento" key={clase.numero}>
+                <div className="momentoHd"><h3>Clase {clase.numero}</h3><span className="min">{unidad.minutosPorClase} min</span></div>
+                <div className="unidadClase">
+                  <p><strong>Objetivo:</strong> {clase.objetivo || "Pendiente de completar"}</p>
+                  <div className="unidadOA"><strong>OA:</strong> {clase.oas.map((o) => `${unidad.cursos[o.curso]?.gradoNombre || "Curso"} · ${o.codigo}`).join("; ") || "Sin objetivos asignados"}</div>
+                  <div className="split" style={{ "--n": Math.max(1, clase.actividades.length) }}>
+                    {clase.actividades.map((a, i) => <div className="col" key={i}>
+                      <h4>{unidad.cursos[a.curso]?.gradoNombre || "Curso"} · {unidad.cursos[a.curso]?.asig || ""}</h4>
+                      <div className="rol est"><div className="lbl">Estudiantes</div><p>{a.estudiantes}</p></div>
+                      <div className="rol doc"><div className="lbl">Docente</div><p>{a.docente}</p></div>
+                    </div>)}
+                  </div>
+                  {clase.actividades.length === 0 && <p className="alertaAlineacion">No se generaron actividades por curso para esta clase; complétalas antes de usar la unidad.</p>}
+                  <div className="unidadEvidencia"><p><strong>Evidencia:</strong> {clase.evidencia || "Revisar evidencia"}</p><p><strong>Evaluación formativa:</strong> {clase.evaluacion || "Definir estrategia"}</p></div>
+                </div>
+              </section>)}
+            </div>
+            <section className="momento">
+              <div className="momentoHd"><h3>Evaluación final de la unidad</h3></div>
+              <div className="unidadClase"><p>{unidad.evaluacionFinal || "Pendiente de definir"}</p></div>
+            </section>
+            <div className="planAcciones noprint">
+              <button className="btn solid" onClick={() => window.print()}>Imprimir unidad</button>
+              <button className="btn" onClick={descargarUnidad}>Descargar unidad</button>
+              <button className="btn" onClick={guardarUnidad}>{unidadGuardadaId ? "Guardar cambios" : "Guardar unidad"}</button>
+              {plan && <button className="btn" onClick={() => setVistaResultado("clase")}>Volver a la clase</button>}
+            </div>
+          </article>
+        )}
+
         {guardadas.length > 0 && (
-          <section className="card noprint" style={{ marginTop: 24, padding: 16 }}>
-            <h3 style={{ margin: "0 0 10px", fontSize: 16 }}>Planificaciones guardadas</h3>
+          <section className="card guardadas noprint">
+            <h3>Planificaciones guardadas</h3>
             {guardadas.map((g) => (
-              <div key={g.id} className="fila" style={{ justifyContent: "space-between", borderBottom: "1px dashed var(--linea)", padding: "8px 0" }}>
-                <span style={{ fontSize: 14 }}>
+              <div key={g.id} className="guardadaFila">
+                <span>
                   {g.titulo} <span className="nota">· {g.fecha}</span>
                 </span>
                 <span className="fila">
-                  <button className="btn sm" onClick={() => setPlan(g.plan)}>
+                  <button className="btn sm" onClick={() => { setPlan(g.plan); setEditandoPlan(false); setPlanGuardadoId(g.id); setVistaResultado("clase"); }}>
                     Abrir
                   </button>
                   <button className="btn sm" onClick={() => borrarGuardada(g.id)}>
@@ -1106,9 +1493,22 @@ Responde SOLO JSON, sin markdown:
           </section>
         )}
 
+        {unidadesGuardadas.length > 0 && (
+          <section className="card guardadas noprint">
+            <h3>Unidades guardadas</h3>
+            {unidadesGuardadas.map((g) => <div key={g.id} className="guardadaFila">
+              <span>{g.titulo} <span className="nota">· {g.fecha}</span></span>
+              <span className="fila">
+                <button className="btn sm" onClick={() => { setUnidad(g.unidad); setUnidadGuardadaId(g.id); setVistaResultado("unidad"); }}>Abrir</button>
+                <button className="btn sm" onClick={() => borrarUnidad(g.id)}>Eliminar</button>
+              </span>
+            </div>)}
+          </section>
+        )}
+
         <p className="nota noprint" style={{ marginTop: 26, maxWidth: "70ch" }}>
-          Los objetivos de 1º y 2º básico vienen de las Bases Curriculares curadas en esta app; los del resto de los cursos se piden en línea y quedan en caché
-          mientras no recargues la página. La marca basal o complementario es una propuesta de priorización: puedes cambiarla en cada objetivo con el botón de
+          Los objetivos de 1º y 2º básico vienen de las Bases Curriculares curadas en esta app; los del resto son sugerencias generadas por IA. Cada tarjeta indica
+          su origen y enlaza a la página curricular del curso. La marca basal o complementario es una propuesta de priorización: puedes cambiarla en cada objetivo con el botón de
           la tarjeta, y agregar objetivos propios si tu establecimiento usa otra redacción. Revisa siempre contra el programa de estudio vigente antes de
           entregar la planificación.
         </p>

@@ -8,14 +8,15 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [react()],
     server: {
+      host: "0.0.0.0",
       port: 5173,
       proxy: {
-        // El navegador llama a /v1/messages y el servidor de desarrollo
-        // reenvía la petición a Anthropic agregando la clave.
-        "/v1": {
+        // En desarrollo, /api/messages se reenvía a Anthropic con la clave local.
+        "/api": {
           target: "https://api.anthropic.com",
           changeOrigin: true,
           secure: true,
+          rewrite: () => "/v1/messages",
           configure: (proxy) => {
             proxy.on("proxyReq", (proxyReq) => {
               if (apiKey) proxyReq.setHeader("x-api-key", apiKey);

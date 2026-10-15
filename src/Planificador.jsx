@@ -854,7 +854,7 @@ Responde SOLO JSON, sin markdown:
       <div className="wrap">
         <header className="hd">
           <div>
-            <h1>Planificador de clases</h1>
+            <h1>PlaniProfe</h1>
             <p>
               Elige uno o varios cursos (de 1º básico a 4º medio), selecciona los objetivos basales y complementarios que quieres trabajar en cada uno, y arma
               la clase con inicio, desarrollo, cierre y materiales.

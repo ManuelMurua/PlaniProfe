@@ -7,7 +7,7 @@ export default function Landing({ onComenzar }) {
   return (
     <div className="ld">
       <div className="ldWrap">
-        <p className="ldKicker">1º básico a 4º medio · aula única o multigrado</p>
+        <p className="ldKicker">PlaniProfe</p>
         <h1>Arma la clase de hoy sin partir de una hoja en blanco</h1>
         <p className="ldLead">
           Elige el curso o los cursos que combinas en tu sala, selecciona los objetivos de aprendizaje —basales y complementarios— que quieres
